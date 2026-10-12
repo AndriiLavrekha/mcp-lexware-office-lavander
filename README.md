@@ -94,6 +94,49 @@ Run the packaged binary from the latest GitHub release (`#semver:^2` resolves to
 }
 ```
 
+### Multi-Account Support (Connect 2, 3, 5+ Accounts)
+
+The server supports connecting to multiple Lexware Office accounts simultaneously (e.g. for sole proprietors in Germany running both a **Freelance / Freiberufler** practice and a **Gewerbe / Commercial enterprise**, or managing multiple businesses).
+
+Inside sandboxed code, the agent can query accounts individually (`lexware.freelance`, `lexware.account('gewerbe')`) or consolidate data across all connected accounts in parallel (`lexware.allAccounts(...)`).
+
+#### Option A: Named Environment Variables
+
+Define accounts using `LEXWARE_OFFICE_API_KEY_<ACCOUNT_ID>`:
+
+```json
+{
+  "mcpServers": {
+    "lexware-office": {
+      "command": "npx",
+      "args": ["-y", "--package=github:JannikWempe/mcp-lexware-office#semver:^2", "lexware-office"],
+      "env": {
+        "LEXWARE_OFFICE_ACCOUNTS": "freelance,gewerbe",
+        "LEXWARE_OFFICE_API_KEY_FREELANCE": "API_KEY_FOR_FREELANCE",
+        "LEXWARE_OFFICE_NAME_FREELANCE": "Freelance IT Consultation",
+        "LEXWARE_OFFICE_ALLOW_WRITES_FREELANCE": "true",
+        "LEXWARE_OFFICE_API_KEY_GEWERBE": "API_KEY_FOR_GEWERBE",
+        "LEXWARE_OFFICE_NAME_GEWERBE": "Gewerbe SaaS & AdSense",
+        "LEXWARE_OFFICE_ALLOW_WRITES_GEWERBE": "false",
+        "LEXWARE_OFFICE_DEFAULT_ACCOUNT": "freelance"
+      }
+    }
+  }
+}
+```
+
+#### Option B: JSON Configuration
+
+For 3+ accounts, pass a JSON string in `LEXWARE_OFFICE_ACCOUNTS_JSON` or specify a file path with `LEXWARE_OFFICE_CONFIG_FILE`:
+
+```json
+{
+  "env": {
+    "LEXWARE_OFFICE_ACCOUNTS_JSON": "[{\"id\":\"freelance\",\"name\":\"Freelance Consulting\",\"apiKey\":\"key1\",\"allowWrites\":true},{\"id\":\"saas\",\"name\":\"SaaS Gewerbe\",\"apiKey\":\"key2\"},{\"id\":\"youtube\",\"name\":\"YouTube & Media\",\"apiKey\":\"key3\"}]"
+  }
+}
+```
+
 **Troubleshooting:** If the `npx` command above fails during git-dependency preparation with an error mentioning `--before`, your npm user config may contain `minimum-release-age`, which conflicts with npm's internal `--before` flag. Two fixes:
 
 ```bash

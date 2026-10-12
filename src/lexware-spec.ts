@@ -12,6 +12,8 @@ export interface LexwareApiCatalog {
 		notes: string[];
 		// Injected at runtime by the MCP server: whether POST/PUT/PATCH/DELETE are currently allowed.
 		writesEnabled?: boolean;
+		accounts?: Array<{ id: string; name: string; writesEnabled: boolean }>;
+		defaultAccountId?: string;
 	};
 	paths: Record<string, Partial<Record<HttpMethod, LexwareOperation>>>;
 	workflows: Record<string, LexwareWorkflow>;

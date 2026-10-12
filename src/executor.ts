@@ -137,14 +137,46 @@ export class QuickJsExecutor implements CodeExecutor {
 				vm.setProp(vm.global, '__capabilitiesJson', capabilitiesHandle);
 			});
 
-			const wrappedCode = `
+		const wrappedCode = `
 "use strict";
 (async () => {
   const __capabilities = JSON.parse(globalThis.__capabilitiesJson);
   const { spec } = __capabilities;
+  const accounts = Array.isArray(__capabilities.accounts) ? __capabilities.accounts : [];
+  const defaultAccountId = typeof __capabilities.defaultAccountId === "string" && __capabilities.defaultAccountId.length > 0
+    ? __capabilities.defaultAccountId
+    : (accounts[0] ? accounts[0].id : undefined);
+
   const lexware = typeof globalThis.__lexwareRequestJson === "function"
     ? (() => {
-        const request = async (input) => JSON.parse(await globalThis.__lexwareRequestJson(JSON.stringify(input ?? {})));
+        const isObjectLike = (value) => value !== null && typeof value === "object";
+
+        const resolveTargetAccount = (input, accountOverride) => {
+          if (typeof accountOverride === "string" && accountOverride.length > 0) {
+            return accountOverride;
+          }
+          if (isObjectLike(input) && typeof input.account === "string" && input.account.length > 0) {
+            return input.account;
+          }
+          if (defaultAccountId) {
+            return defaultAccountId;
+          }
+          if (accounts.length === 1) {
+            return accounts[0].id;
+          }
+          if (accounts.length > 1) {
+            const list = accounts.map(a => a.id).join(", ");
+            throw new Error("Multiple Lexware accounts configured (" + list + "). Please specify the account: lexware.account('id').request(...) or { account: 'id', path: '...' }");
+          }
+          return undefined;
+        };
+
+        const executeHostRequest = async (input, accountOverride) => {
+          const account = resolveTargetAccount(input, accountOverride);
+          const payload = { account, request: input ?? {} };
+          return JSON.parse(await globalThis.__lexwareRequestJson(JSON.stringify(payload)));
+        };
+
         const assertOkJsonResponse = (response, helperName) => {
           if (!response || typeof response !== "object") {
             throw new Error(helperName + " expected lexware.request to return a LexwareResponse object");
@@ -169,8 +201,109 @@ export class QuickJsExecutor implements CodeExecutor {
           }
           return response.data;
         };
-        const json = async (input) => assertOkJsonResponse(await request(input), "lexware.json");
-        const isObjectLike = (value) => value !== null && typeof value === "object";
+
+        const paginateWithClient = async (input, options = {}, accountOverride) => {
+          if (!input || typeof input !== "object" || Array.isArray(input)) {
+            throw new Error("lexware.paginate expects an object: { path, query?, method?, account? }");
+          }
+          const method = String(input.method || "GET").toUpperCase();
+          if (method !== "GET") {
+            throw new Error("lexware.paginate only supports GET list endpoints");
+          }
+          if (options == null || typeof options !== "object" || Array.isArray(options)) {
+            throw new Error("lexware.paginate options must be an object when provided");
+          }
+          const maxPages = options.maxPages === undefined ? Infinity : Number(options.maxPages);
+          if (!(maxPages === Infinity || (Number.isInteger(maxPages) && maxPages >= 1))) {
+            throw new Error("lexware.paginate options.maxPages must be a positive integer");
+          }
+          const originalQuery = input.query == null ? {} : input.query;
+          if (typeof originalQuery !== "object" || Array.isArray(originalQuery)) {
+            throw new Error("lexware.paginate input.query must be an object when provided");
+          }
+          const baseQuery = { ...originalQuery };
+          let page = baseQuery.page === undefined || baseQuery.page === null ? 0 : Number(baseQuery.page);
+          if (!Number.isInteger(page) || page < 0) {
+            throw new Error("lexware.paginate query.page must be a zero-based non-negative integer");
+          }
+          const size = baseQuery.size === undefined || baseQuery.size === null ? 250 : baseQuery.size;
+          const items = [];
+          let pagesFetched = 0;
+          while (pagesFetched < maxPages) {
+            const response = await executeHostRequest({ ...input, method: "GET", query: { ...baseQuery, page, size } }, accountOverride);
+            const data = assertOkJsonResponse(response, "lexware.paginate");
+            if (!data || typeof data !== "object" || !Array.isArray(data.content)) {
+              throw new Error("lexware.paginate expected response.data.content to be an array. Use lexware.request/json for non-paged endpoints.");
+            }
+            items.push(...data.content);
+            pagesFetched += 1;
+            if (data.last === true) break;
+            if (typeof data.totalPages === "number" && page + 1 >= data.totalPages) break;
+            if (data.content.length === 0) break;
+            page += 1;
+          }
+          return items;
+        };
+
+        const createAccountClient = (accountMeta) => {
+          const accId = accountMeta.id;
+          const req = async (input) => executeHostRequest(input, accId);
+          const jsn = async (input) => assertOkJsonResponse(await req(input), "lexware.json");
+          const pag = async (input, opts = {}) => paginateWithClient(input, opts, accId);
+          return Object.freeze({
+            id: accId,
+            name: accountMeta.name,
+            writesEnabled: Boolean(accountMeta.writesEnabled),
+            request: req,
+            json: jsn,
+            paginate: pag,
+          });
+        };
+
+        const accountClientsMap = {};
+        for (const meta of accounts) {
+          accountClientsMap[meta.id] = createAccountClient(meta);
+        }
+
+        const getAccountClient = (id) => {
+          if (typeof id !== "string" || id.length === 0) {
+            throw new Error("account id must be a non-empty string");
+          }
+          const client = accountClientsMap[id];
+          if (!client) {
+            const available = accounts.map(a => a.id).join(", ");
+            throw new Error("Lexware account '" + id + "' not found. Available accounts: " + (available || "none"));
+          }
+          return client;
+        };
+
+        const allAccounts = async (callback) => {
+          if (typeof callback !== "function") {
+            throw new Error("lexware.allAccounts expects an async function: async (client, accountId) => ...");
+          }
+          const results = {};
+          await Promise.all(accounts.map(async (meta) => {
+            const client = accountClientsMap[meta.id];
+            results[meta.id] = await callback(client, meta.id);
+          }));
+          return results;
+        };
+
+        const mapAccounts = async (accountIds, callback) => {
+          if (!Array.isArray(accountIds)) {
+            throw new Error("lexware.mapAccounts expects an array of account IDs as first argument");
+          }
+          if (typeof callback !== "function") {
+            throw new Error("lexware.mapAccounts expects an async callback as second argument");
+          }
+          const results = {};
+          await Promise.all(accountIds.map(async (id) => {
+            const client = getAccountClient(id);
+            results[id] = await callback(client, id);
+          }));
+          return results;
+        };
+
         const getPathValue = (row, fieldPath) => {
           if (typeof fieldPath !== "string" || fieldPath.length === 0) {
             throw new Error("fieldPath must be a non-empty string");
@@ -259,57 +392,33 @@ export class QuickJsExecutor implements CodeExecutor {
           const fraction = String(absoluteCents % 100).padStart(2, "0");
           return String(currency) + " " + sign + whole + "." + fraction;
         };
-        const paginate = async (input, options = {}) => {
-          if (!input || typeof input !== "object" || Array.isArray(input)) {
-            throw new Error("lexware.paginate expects an object: { path, query?, method? }");
-          }
-          const method = String(input.method || "GET").toUpperCase();
-          if (method !== "GET") {
-            throw new Error("lexware.paginate only supports GET list endpoints");
-          }
-          if (options == null || typeof options !== "object" || Array.isArray(options)) {
-            throw new Error("lexware.paginate options must be an object when provided");
-          }
-          const maxPages = options.maxPages === undefined ? Infinity : Number(options.maxPages);
-          if (!(maxPages === Infinity || (Number.isInteger(maxPages) && maxPages >= 1))) {
-            throw new Error("lexware.paginate options.maxPages must be a positive integer");
-          }
-          const originalQuery = input.query == null ? {} : input.query;
-          if (typeof originalQuery !== "object" || Array.isArray(originalQuery)) {
-            throw new Error("lexware.paginate input.query must be an object when provided");
-          }
-          const baseQuery = { ...originalQuery };
-          let page = baseQuery.page === undefined || baseQuery.page === null ? 0 : Number(baseQuery.page);
-          if (!Number.isInteger(page) || page < 0) {
-            throw new Error("lexware.paginate query.page must be a zero-based non-negative integer");
-          }
-          const size = baseQuery.size === undefined || baseQuery.size === null ? 250 : baseQuery.size;
-          const items = [];
-          let pagesFetched = 0;
-          while (pagesFetched < maxPages) {
-            const response = await request({ ...input, method: "GET", query: { ...baseQuery, page, size } });
-            const data = assertOkJsonResponse(response, "lexware.paginate");
-            if (!data || typeof data !== "object" || !Array.isArray(data.content)) {
-              throw new Error("lexware.paginate expected response.data.content to be an array. Use lexware.request/json for non-paged endpoints.");
-            }
-            items.push(...data.content);
-            pagesFetched += 1;
-            if (data.last === true) break;
-            if (typeof data.totalPages === "number" && page + 1 >= data.totalPages) break;
-            if (data.content.length === 0) break;
-            page += 1;
-          }
-          return items;
-        };
-        return Object.freeze({
-          request,
-          json,
-          paginate,
+
+        const baseLexware = {
+          accounts: Object.freeze([...accounts]),
+          account: getAccountClient,
+          allAccounts,
+          mapAccounts,
+          request: async (input) => executeHostRequest(input),
+          json: async (input) => assertOkJsonResponse(await executeHostRequest(input), "lexware.json"),
+          paginate: async (input, options = {}) => paginateWithClient(input, options),
           requireNumber,
           requireMoney,
           sumMoney,
-          formatMoney
-        });
+          formatMoney,
+        };
+
+        const reservedKeys = new Set([
+          "accounts", "account", "allAccounts", "mapAccounts",
+          "request", "json", "paginate",
+          "requireNumber", "requireMoney", "sumMoney", "formatMoney"
+        ]);
+        for (const meta of accounts) {
+          if (!reservedKeys.has(meta.id)) {
+            baseLexware[meta.id] = accountClientsMap[meta.id];
+          }
+        }
+
+        return Object.freeze(baseLexware);
       })()
     : undefined;
   const __userFunction = (${code});
@@ -318,7 +427,7 @@ export class QuickJsExecutor implements CodeExecutor {
   }
   return await __userFunction();
 })()
-`;
+\`;
 
 			const evaluation = vm.evalCode(wrappedCode, filename, { type: 'global' });
 			if (evaluation.error) {

@@ -108,6 +108,14 @@ Useful helper methods are also exposed inside `execute`:
 
 ```ts
 declare const lexware: {
+  // Accounts metadata & selectors:
+  accounts: Array<{ id: string; name: string; writesEnabled: boolean }>;
+  account(id: string): LexwareAccountClient;
+  [accountId: string]: LexwareAccountClient | any; // direct shorthand, e.g. lexware.freelance, lexware.saas
+  allAccounts<T>(callback: (client: LexwareAccountClient, accountId: string) => Promise<T>): Promise<Record<string, T>>;
+  mapAccounts<T>(accountIds: string[], callback: (client: LexwareAccountClient, accountId: string) => Promise<T>): Promise<Record<string, T>>;
+
+  // Operations on default or single account:
   request<T = unknown>(input: LexwareRequest): Promise<LexwareResponse<T>>;
   json(input: LexwareRequest): Promise<unknown>;
   paginate<T = unknown>(input: LexwareRequest, options?: { maxPages?: number }): Promise<T[]>;
@@ -116,6 +124,51 @@ declare const lexware: {
   sumMoney(rows: unknown[], fieldPath: string): number;
   formatMoney(cents: number, currency?: string): string;
 };
+```
+
+## Multi-Account & Cross-Account Consolidation
+
+When connecting multiple Lexware Office accounts ($N \ge 1$), the server injects account discovery metadata and scoped clients into the sandboxed `execute` tool:
+
+```js
+async () => {
+  // Run queries across all accounts concurrently
+  const reportByAccount = await lexware.allAccounts(async (client) => {
+    const vouchers = await client.paginate({
+      path: '/v1/voucherlist',
+      query: { voucherType: 'invoice', voucherStatus: 'paid' }
+    });
+
+    const netCents = lexware.sumMoney(vouchers, 'totalAmount');
+    return {
+      name: client.name,
+      invoiceCount: vouchers.length,
+      netRevenueCents: netCents,
+      netRevenue: lexware.formatMoney(netCents)
+    };
+  });
+
+  const totalCents = Object.values(reportByAccount).reduce((sum, item) => sum + item.netRevenueCents, 0);
+
+  return {
+    accounts: reportByAccount,
+    consolidatedRevenue: lexware.formatMoney(totalCents)
+  };
+}
+```
+
+Or query specific accounts explicitly:
+
+```js
+async () => {
+  const freelanceInvoices = await lexware.freelance.paginate({ path: '/v1/voucherlist', query: { voucherType: 'invoice' } });
+  const gewerbeInvoices = await lexware.account('gewerbe').paginate({ path: '/v1/voucherlist', query: { voucherType: 'invoice' } });
+
+  return {
+    freelance: freelanceInvoices.length,
+    gewerbe: gewerbeInvoices.length
+  };
+}
 ```
 
 ## Binary-safe file uploads
