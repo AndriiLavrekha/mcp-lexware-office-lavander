@@ -23,5 +23,6 @@ Security hardening of multi-account support (review of b061d3c). Branch: `fix/mu
 - [x] 13. Tests for all of the above; README + docs/guide.md updated
 - [x] 14. typecheck + full test run green (85/85); Docker build + stdio E2E verified
 - [x] 15. Independent review agent; all findings fixed (92/92 tests)
-- [x] 16. Merge to main and push
+- [x] 16. Merge to main (fast-forward)
+- [ ] 16b. Push main to origin (blocked: GitHub token invalid; user runs gh auth login, then git push origin main)
 - [ ] 17. User: test MCP with multiple real Lexware accounts
