@@ -171,6 +171,14 @@ async () => {
 }
 ```
 
+Account selection rules:
+
+- Reads without an account go to the default account (`LEXWARE_OFFICE_DEFAULT_ACCOUNT`, otherwise the first configured account).
+- With two or more accounts, `POST`/`PUT`/`PATCH`/`DELETE` **must** name the account (`lexware.account('id')`, `lexware.<id>`, or `{ account: 'id', ... }`); otherwise the request is rejected, so writes never land in the wrong books by accident.
+- `maxRequests` is shared across all accounts in one `execute` call — raise it (max 50) for `allAccounts` + `paginate` reports.
+
+Account configuration is validated at startup and the server exits on any error instead of falling back to another source: invalid JSON, a missing `apiKey`, a duplicate id (ids are lowercased and non `[a-z0-9_-]` characters become `_`), an account listed in `LEXWARE_OFFICE_ACCOUNTS` without a key, an unknown `LEXWARE_OFFICE_DEFAULT_ACCOUNT`, a reserved id (`accounts`, `account`, `request`, `json`, `paginate`, `constructor`, `prototype`, `then`, or one starting with `_`), or a non-`https://` `baseUrl`. Error messages never include config contents.
+
 ## Binary-safe file uploads
 
 Three binary-safe upload modes are supported in addition to the legacy `rawBody=true` string-based multipart. Prefer `multipart` with `contentPath` — the file's bytes never pass through the model or the sandbox.
@@ -195,9 +203,9 @@ async () => {
 }
 ```
 
-- `contentPath` must be an absolute path to a regular file on the machine running the MCP server (25 MB cap).
+- `contentPath` is **disabled unless `LEXWARE_OFFICE_UPLOAD_DIR` is set**. The path must be absolute and resolve (after following symlinks) to a regular file inside that directory, with extension `.pdf`, `.jpg`, `.jpeg`, `.png`, or `.xml` (25 MB cap). The account config file (`LEXWARE_OFFICE_CONFIG_FILE`) is always refused. This keeps sandboxed code — which may be steered by prompt injection in Lexware data — from reading arbitrary host files.
 - `filename` defaults to the `contentPath` basename.
-- Uploads are writes: they require `LEXWARE_OFFICE_ALLOW_WRITES=true`. Check `spec.info.writesEnabled` to branch early.
+- Uploads are writes: the target account must allow writes. Check `client.writesEnabled` to branch early.
 
 ### `multipart` with `contentBase64` — binary FormData parts
 
@@ -243,11 +251,15 @@ To enable writes, set:
 }
 ```
 
-Priority order (highest wins):
+Priority order per account (highest wins):
 
-1. `LEXWARE_OFFICE_READ_ONLY=true` → writes always blocked
-2. `LEXWARE_OFFICE_ALLOW_WRITES=true` → writes allowed
-3. Default (neither set) → writes blocked
+1. Global `LEXWARE_OFFICE_READ_ONLY=true` → writes always blocked on every account, regardless of per-account settings
+2. Per-account read-only (`LEXWARE_OFFICE_READ_ONLY_<ID>=true` / `"readOnly": true`) → blocked
+3. Per-account opt-in (`LEXWARE_OFFICE_ALLOW_WRITES_<ID>=true` / `"allowWrites": true`) → allowed (`false` → blocked)
+4. Global `LEXWARE_OFFICE_ALLOW_WRITES=true` → allowed, **only in single-account setups**; with two or more accounts each account must opt in on its own
+5. Default → writes blocked
+
+`spec.info.writesEnabled` is `true` when at least one account allows writes; `spec.info.accounts[].writesEnabled` is per account.
 
 When writes are blocked, `POST`, `PUT`, `PATCH`, and `DELETE` requests are rejected with a clear error message.
 
@@ -256,6 +268,14 @@ Important behavior:
 - Default read-only mirrors how Cloudflare's OAuth scope template defaults to read-only; Lexware API keys have no equivalent OAuth scopes, so the MCP server provides the safety boundary.
 - Writes should only be enabled when the user explicitly needs a write operation.
 - The API key remains in the host process and is never exposed to sandboxed code.
+- `baseUrl` / `LEXWARE_OFFICE_API_BASE_URL` must be `https://` so the bearer token never travels in plaintext.
+
+## Handling sensitive data
+
+- Everything `execute` returns (customers, amounts, IBANs, documents) is sent to your LLM provider. Make sure your data-processing agreement (AVV / GDPR DPA) with that provider covers bookkeeping data.
+- Text inside Lexware records (contact names, remarks, voucher notes) is untrusted input to the model. Keep writes disabled on accounts that don't need them and keep `LEXWARE_OFFICE_UPLOAD_DIR` narrow.
+- Prefer `LEXWARE_OFFICE_CONFIG_FILE` with owner-only file permissions over API keys pasted into the MCP client config.
+- Pin the GitHub package spec to a reviewed commit (`github:<owner>/mcp-lexware-office#<sha>`) instead of `#semver:^2` so a new push cannot change the code that handles your keys.
 
 ## Migrating from 1.x
 

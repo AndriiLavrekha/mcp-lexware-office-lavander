@@ -1,12 +1,12 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { QuickJsExecutor } from './executor.js';
-import { LexwareApiClient, writesEnabled } from './lexware-client.js';
+import { LexwareApiClient, LexwareClientRegistry } from './lexware-client.js';
 import { lexwareSpec } from './lexware-spec.js';
 import { stringifyForMcp, truncateText } from './truncate.js';
 
@@ -43,6 +43,8 @@ test('server registers exactly search and execute tools', async () => {
 	assert.doesNotMatch(source, /get-revenue-summary|allowWrite/);
 	assert.match(source, /spec\.info\.domainIndex: compact map/);
 	assert.match(source, /lexware\.request returns all HTTP responses/);
+	assert.match(source, /registry\.resolve\(accountId, requestData\)/, 'execute must route through registry.resolve so 2+ account writes need an explicit account');
+	assert.match(source, /process\.exit\(1\)/, 'account configuration errors must be fatal at startup');
 });
 
 test('execute sandbox exposes generic request but not API key or Node globals', async () => {
@@ -343,7 +345,9 @@ test('invalid base64 in bodyBase64 or contentBase64 is rejected before fetch', a
 test('multipart with contentPath reads the file host-side and echoes sent bytes/sha256', async () => {
 	const originalAllowWrites = process.env.LEXWARE_OFFICE_ALLOW_WRITES;
 	process.env.LEXWARE_OFFICE_ALLOW_WRITES = 'true';
+	const originalUploadDir = process.env.LEXWARE_OFFICE_UPLOAD_DIR;
 	const dir = await mkdtemp(join(tmpdir(), 'lexware-upload-'));
+	process.env.LEXWARE_OFFICE_UPLOAD_DIR = dir;
 	try {
 		const fileBytes = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x01, 0x02, 0x03]); // "%PDF" + binary
 		const filePath = join(dir, 'receipt beleg.pdf');
@@ -380,6 +384,8 @@ test('multipart with contentPath reads the file host-side and echoes sent bytes/
 		});
 	} finally {
 		await rm(dir, { recursive: true, force: true });
+		if (originalUploadDir === undefined) delete process.env.LEXWARE_OFFICE_UPLOAD_DIR;
+		else process.env.LEXWARE_OFFICE_UPLOAD_DIR = originalUploadDir;
 		if (originalAllowWrites === undefined) delete process.env.LEXWARE_OFFICE_ALLOW_WRITES;
 		else process.env.LEXWARE_OFFICE_ALLOW_WRITES = originalAllowWrites;
 	}
@@ -387,7 +393,10 @@ test('multipart with contentPath reads the file host-side and echoes sent bytes/
 
 test('contentPath validation: relative paths, missing files, and mode conflicts are rejected before fetch', async () => {
 	const originalAllowWrites = process.env.LEXWARE_OFFICE_ALLOW_WRITES;
+	const originalUploadDir = process.env.LEXWARE_OFFICE_UPLOAD_DIR;
 	process.env.LEXWARE_OFFICE_ALLOW_WRITES = 'true';
+	const dir = await mkdtemp(join(tmpdir(), 'lexware-upload-'));
+	process.env.LEXWARE_OFFICE_UPLOAD_DIR = dir;
 	try {
 		const { client, calls } = clientWithCalls(async () => responseFor(200, '{}'));
 
@@ -396,7 +405,7 @@ test('contentPath validation: relative paths, missing files, and mode conflicts 
 			/contentPath must be an absolute path/,
 		);
 		await assert.rejects(
-			() => client.request({ method: 'POST', path: '/v1/files', multipart: [{ name: 'file', contentPath: '/definitely/not/a/real/file.pdf' }, { name: 'type', value: 'voucher' }] }),
+			() => client.request({ method: 'POST', path: '/v1/files', multipart: [{ name: 'file', contentPath: join(dir, 'missing.pdf') }, { name: 'type', value: 'voucher' }] }),
 			/contentPath not found or not readable/,
 		);
 		await assert.rejects(
@@ -405,6 +414,60 @@ test('contentPath validation: relative paths, missing files, and mode conflicts 
 		);
 		assert.equal(calls.length, 0);
 	} finally {
+		await rm(dir, { recursive: true, force: true });
+		if (originalUploadDir === undefined) delete process.env.LEXWARE_OFFICE_UPLOAD_DIR;
+		else process.env.LEXWARE_OFFICE_UPLOAD_DIR = originalUploadDir;
+		if (originalAllowWrites === undefined) delete process.env.LEXWARE_OFFICE_ALLOW_WRITES;
+		else process.env.LEXWARE_OFFICE_ALLOW_WRITES = originalAllowWrites;
+	}
+});
+
+test('contentPath is confined to LEXWARE_OFFICE_UPLOAD_DIR with an extension allowlist', async () => {
+	const originalAllowWrites = process.env.LEXWARE_OFFICE_ALLOW_WRITES;
+	const originalUploadDir = process.env.LEXWARE_OFFICE_UPLOAD_DIR;
+	const originalConfigFile = process.env.LEXWARE_OFFICE_CONFIG_FILE;
+	process.env.LEXWARE_OFFICE_ALLOW_WRITES = 'true';
+	const root = await mkdtemp(join(tmpdir(), 'lexware-upload-root-'));
+	const uploadDir = join(root, 'uploads');
+	const outsideFile = join(root, 'secret.pdf');
+	try {
+		await mkdir(uploadDir);
+		await writeFile(outsideFile, 'secret');
+		await writeFile(join(uploadDir, 'notes.txt'), 'text');
+		await writeFile(join(uploadDir, 'accounts.pdf'), '[]');
+		const { client, calls } = clientWithCalls(async () => responseFor(200, '{}'));
+		const upload = (contentPath: string) => client.request({ method: 'POST', path: '/v1/files', multipart: [{ name: 'file', contentPath }, { name: 'type', value: 'voucher' }] });
+
+		delete process.env.LEXWARE_OFFICE_UPLOAD_DIR;
+		await assert.rejects(() => upload(join(uploadDir, 'accounts.pdf')), /contentPath uploads are disabled/);
+
+		process.env.LEXWARE_OFFICE_UPLOAD_DIR = uploadDir;
+		await assert.rejects(() => upload(outsideFile), /must be inside LEXWARE_OFFICE_UPLOAD_DIR/);
+		await assert.rejects(() => upload(join(uploadDir, '..', 'secret.pdf')), /must be inside LEXWARE_OFFICE_UPLOAD_DIR/);
+		await assert.rejects(() => upload(join(uploadDir, 'notes.txt')), /must have one of the extensions/);
+
+		process.env.LEXWARE_OFFICE_CONFIG_FILE = join(uploadDir, 'accounts.pdf');
+		await assert.rejects(() => upload(join(uploadDir, 'accounts.pdf')), /must not point at the Lexware account configuration file/);
+
+		let symlinkCreated = true;
+		try {
+			await symlink(outsideFile, join(uploadDir, 'link.pdf'));
+		} catch (error) {
+			// Creating symlinks needs extra privileges on Windows; skip that case there.
+			if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+			symlinkCreated = false;
+		}
+		if (symlinkCreated) {
+			await assert.rejects(() => upload(join(uploadDir, 'link.pdf')), /must be inside LEXWARE_OFFICE_UPLOAD_DIR/);
+		}
+
+		assert.equal(calls.length, 0);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+		if (originalUploadDir === undefined) delete process.env.LEXWARE_OFFICE_UPLOAD_DIR;
+		else process.env.LEXWARE_OFFICE_UPLOAD_DIR = originalUploadDir;
+		if (originalConfigFile === undefined) delete process.env.LEXWARE_OFFICE_CONFIG_FILE;
+		else process.env.LEXWARE_OFFICE_CONFIG_FILE = originalConfigFile;
 		if (originalAllowWrites === undefined) delete process.env.LEXWARE_OFFICE_ALLOW_WRITES;
 		else process.env.LEXWARE_OFFICE_ALLOW_WRITES = originalAllowWrites;
 	}
@@ -451,15 +514,16 @@ test('writesEnabled reflects the env gate and is injected into the sandbox spec'
 	const originalReadOnly = process.env.LEXWARE_OFFICE_READ_ONLY;
 	const originalAllowWrites = process.env.LEXWARE_OFFICE_ALLOW_WRITES;
 	try {
+		const registry = new LexwareClientRegistry([{ id: 'default', apiKey: 'k' }]);
 		delete process.env.LEXWARE_OFFICE_READ_ONLY;
 		delete process.env.LEXWARE_OFFICE_ALLOW_WRITES;
-		assert.equal(writesEnabled(), false);
+		assert.equal(registry.anyWritesEnabled(), false);
 
 		process.env.LEXWARE_OFFICE_ALLOW_WRITES = 'true';
-		assert.equal(writesEnabled(), true);
+		assert.equal(registry.anyWritesEnabled(), true);
 
 		process.env.LEXWARE_OFFICE_READ_ONLY = 'true';
-		assert.equal(writesEnabled(), false);
+		assert.equal(registry.anyWritesEnabled(), false);
 	} finally {
 		if (originalReadOnly === undefined) delete process.env.LEXWARE_OFFICE_READ_ONLY;
 		else process.env.LEXWARE_OFFICE_READ_ONLY = originalReadOnly;
@@ -468,7 +532,7 @@ test('writesEnabled reflects the env gate and is injected into the sandbox spec'
 	}
 
 	const source = await readFile('src/index.ts', 'utf8');
-	assert.match(source, /writesEnabled: writesEnabled\(\)/, 'index.ts must inject writesEnabled into the sandbox spec');
+	assert.match(source, /writesEnabled: registry\.anyWritesEnabled\(\)/, 'index.ts must inject writesEnabled into the sandbox spec');
 	assert.match(source, /spec\.info\.writesEnabled/, 'tool docs must mention spec.info.writesEnabled');
 	assert.match(source, /contentPath/, 'execute tool docs must document contentPath uploads');
 	assert.match(source, /multipart\?: MultipartPart\[\]/, 'execute tool docs must document the multipart request field');

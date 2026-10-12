@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { readFile, stat } from 'node:fs/promises';
-import { basename, isAbsolute } from 'node:path';
+import { readFile, realpath, stat } from 'node:fs/promises';
+import { basename, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import { lexwareSpec, type HttpMethod, type LexwareOperation } from './lexware-spec.js';
 import { truncateText } from './truncate.js';
@@ -140,7 +140,7 @@ export class LexwareApiClient {
 		this.id = options.id ?? 'default';
 		this.name = options.name ?? this.id;
 		this.apiKey = options.apiKey ?? process.env.LEXWARE_OFFICE_API_KEY;
-		this.baseUrl = options.baseUrl ?? process.env.LEXWARE_OFFICE_API_BASE_URL ?? DEFAULT_BASE_URL;
+		this.baseUrl = validateBaseUrl(options.baseUrl ?? process.env.LEXWARE_OFFICE_API_BASE_URL ?? DEFAULT_BASE_URL, this.id);
 		this.userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
 		this.fetchImpl = options.fetchImpl ?? fetch;
 		this.maxResponseChars = options.maxResponseChars ?? DEFAULT_MAX_RESPONSE_CHARS;
@@ -151,16 +151,10 @@ export class LexwareApiClient {
 	}
 
 	writesEnabled(): boolean {
-		if (this.readOnly !== undefined) {
-			if (this.readOnly) return false;
-		} else if (process.env.LEXWARE_OFFICE_READ_ONLY === 'true') {
-			return false;
-		}
-
-		if (this.allowWrites !== undefined) {
-			return this.allowWrites;
-		}
-
+		// Hard block: the global READ_ONLY wins over every per-account setting.
+		if (process.env.LEXWARE_OFFICE_READ_ONLY === 'true') return false;
+		if (this.readOnly === true) return false;
+		if (this.allowWrites !== undefined) return this.allowWrites;
 		return process.env.LEXWARE_OFFICE_ALLOW_WRITES === 'true';
 	}
 
@@ -172,7 +166,7 @@ export class LexwareApiClient {
 
 		const normalized = normalizeRequest(input);
 		if (WRITE_METHODS.has(normalized.method) && !this.writesEnabled()) {
-			throw new Error(`${normalized.method} ${normalized.path} is blocked on account '${this.id}': writes are disabled. Set allowWrites=true for this account or LEXWARE_OFFICE_ALLOW_WRITES=true.`);
+			throw new Error(`${normalized.method} ${normalized.path} is blocked on account '${this.id}': writes are disabled by default. Enable them for this account (LEXWARE_OFFICE_ALLOW_WRITES_<ID>=true or allowWrites: true; LEXWARE_OFFICE_ALLOW_WRITES=true in single-account setups). LEXWARE_OFFICE_READ_ONLY=true overrides all of these.`);
 		}
 
 		await this.waitForRateLimitTurn();
@@ -201,9 +195,9 @@ export class LexwareApiClient {
 				});
 			} catch (error) {
 				if (controller.signal.aborted || isAbortError(error)) {
-					throw new Error(`Lexware API request timed out after ${this.requestTimeoutMs}ms for ${normalized.method} ${normalized.path} on account '${this.id}'`);
+					throw new Error(`Lexware API request timed out after ${this.requestTimeoutMs}ms for ${normalized.method} ${normalized.path} (account '${this.id}')`);
 				}
-				throw new Error(`Lexware API network error for ${normalized.method} ${normalized.path} on account '${this.id}': ${sanitizeFetchErrorMessage(error, apiKey)}`);
+				throw new Error(`Lexware API network error for ${normalized.method} ${normalized.path}: ${sanitizeFetchErrorMessage(error, apiKey)} (account '${this.id}')`);
 			}
 
 			const parsed = await parseResponse(response, normalized, this.maxResponseChars);
@@ -237,18 +231,26 @@ export class LexwareClientRegistry {
 		sharedOptions: Partial<LexwareClientOptions> = {},
 	) {
 		for (const acc of accounts) {
+			assertValidAccountId(acc.id);
+			if (this.clients.has(acc.id)) {
+				throw new Error(`Duplicate Lexware account id '${acc.id}'`);
+			}
 			const client = new LexwareApiClient({
+				...sharedOptions,
 				id: acc.id,
 				name: acc.name ?? acc.id,
 				apiKey: acc.apiKey,
 				baseUrl: acc.baseUrl,
 				allowWrites: acc.allowWrites,
 				readOnly: acc.readOnly,
-				...sharedOptions,
 			});
 			this.clients.set(acc.id, client);
 		}
-		if (defaultAccountId && this.clients.has(defaultAccountId)) {
+		if (defaultAccountId !== undefined) {
+			if (!this.clients.has(defaultAccountId)) {
+				const available = Array.from(this.clients.keys()).join(', ');
+				throw new Error(`LEXWARE_OFFICE_DEFAULT_ACCOUNT '${defaultAccountId}' does not match a configured account. Available accounts: [${available}]`);
+			}
 			this.defaultAccountId = defaultAccountId;
 		} else if (accounts.length > 0) {
 			this.defaultAccountId = accounts[0].id;
@@ -268,6 +270,21 @@ export class LexwareClientRegistry {
 		return client;
 	}
 
+	/**
+	 * Resolves the client for a sandbox request. With 2+ accounts, writes must name
+	 * their account explicitly so they never land in the default account by accident.
+	 */
+	resolve(accountId: string | undefined, request: unknown): LexwareApiClient {
+		if (accountId === undefined && this.clients.size > 1) {
+			const method = request && typeof request === 'object' ? (request as { method?: unknown }).method : undefined;
+			if (typeof method === 'string' && WRITE_METHODS.has(method.toUpperCase() as LexwareExecuteMethod)) {
+				const available = Array.from(this.clients.keys()).join(', ');
+				throw new Error(`${method.toUpperCase()} requests must name the target account when multiple Lexware accounts are configured ([${available}]). Use lexware.account('id').request(...) or { account: 'id', ... }.`);
+			}
+		}
+		return this.get(accountId);
+	}
+
 	has(accountId: string): boolean {
 		return this.clients.has(accountId);
 	}
@@ -280,136 +297,189 @@ export class LexwareClientRegistry {
 		}));
 	}
 
+	anyWritesEnabled(): boolean {
+		return Array.from(this.clients.values()).some((client) => client.writesEnabled());
+	}
+
 	get count(): number {
 		return this.clients.size;
 	}
 }
 
+// Ids that would collide with built-in members of the sandbox `lexware` object or object prototypes.
+const RESERVED_ACCOUNT_IDS = new Set(['accounts', 'account', 'request', 'json', 'paginate', 'constructor', 'prototype', 'then']);
+const ACCOUNT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+
+function assertValidAccountId(id: string): void {
+	if (!ACCOUNT_ID_PATTERN.test(id) || RESERVED_ACCOUNT_IDS.has(id)) {
+		throw new Error(`Invalid Lexware account id '${id}': use lowercase letters, digits, '_' or '-', starting with a letter or digit, and not one of [${Array.from(RESERVED_ACCOUNT_IDS).join(', ')}]`);
+	}
+}
+
+/**
+ * Loads account configuration from the environment. Throws on any misconfiguration
+ * instead of falling back to another source, and never includes config contents
+ * (which may hold API keys) in error messages.
+ */
 export function loadAccountsFromEnv(): { accounts: AccountConfig[]; defaultAccountId?: string } {
 	const accounts: AccountConfig[] = [];
-	const seenIds = new Set<string>();
+	const addAccount = (account: AccountConfig, source: string) => {
+		assertValidAccountId(account.id);
+		if (accounts.some((existing) => existing.id === account.id)) {
+			throw new Error(`Duplicate Lexware account id '${account.id}' (from ${source}). Account ids must be unique after normalization.`);
+		}
+		accounts.push(account);
+	};
 
 	// 1. Config file (LEXWARE_OFFICE_CONFIG_FILE)
 	const configFilePath = process.env.LEXWARE_OFFICE_CONFIG_FILE;
-	if (configFilePath) {
+	if (configFilePath !== undefined && configFilePath.trim().length > 0) {
+		let content: string;
 		try {
-			const content = readFileSync(configFilePath, 'utf8');
-			const parsed = JSON.parse(content) as unknown;
-			const list = Array.isArray(parsed)
-				? parsed
-				: parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).accounts)
-					? (parsed as Record<string, unknown>).accounts
-					: [];
-			for (const item of list as Array<Record<string, unknown>>) {
-				if (item && typeof item === 'object' && item.apiKey) {
-					const id = normalizeAccountId(String(item.id || item.name || `account_${accounts.length + 1}`));
-					if (!seenIds.has(id)) {
-						seenIds.add(id);
-						accounts.push({
-							id,
-							name: typeof item.name === 'string' ? item.name : id,
-							apiKey: String(item.apiKey).trim(),
-							allowWrites: typeof item.allowWrites === 'boolean' ? item.allowWrites : undefined,
-							readOnly: typeof item.readOnly === 'boolean' ? item.readOnly : undefined,
-							baseUrl: typeof item.baseUrl === 'string' ? item.baseUrl : undefined,
-						});
-					}
-				}
-			}
+			content = readFileSync(configFilePath, 'utf8');
 		} catch (error) {
-			console.error(`Warning: Failed to load Lexware accounts from config file ${configFilePath}:`, error);
+			const code = (error as NodeJS.ErrnoException)?.code ?? 'read error';
+			throw new Error(`Failed to read LEXWARE_OFFICE_CONFIG_FILE (${code})`);
+		}
+		for (const account of parseAccountList(content, 'LEXWARE_OFFICE_CONFIG_FILE')) {
+			addAccount(account, 'LEXWARE_OFFICE_CONFIG_FILE');
 		}
 	}
 
 	// 2. JSON in environment variable (LEXWARE_OFFICE_ACCOUNTS_JSON)
 	const accountsJson = process.env.LEXWARE_OFFICE_ACCOUNTS_JSON;
-	if (accountsJson) {
-		try {
-			const parsed = JSON.parse(accountsJson) as unknown;
-			const list = Array.isArray(parsed)
-				? parsed
-				: parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).accounts)
-					? (parsed as Record<string, unknown>).accounts
-					: [];
-			for (const item of list as Array<Record<string, unknown>>) {
-				if (item && typeof item === 'object' && item.apiKey) {
-					const id = normalizeAccountId(String(item.id || item.name || `account_${accounts.length + 1}`));
-					if (!seenIds.has(id)) {
-						seenIds.add(id);
-						accounts.push({
-							id,
-							name: typeof item.name === 'string' ? item.name : id,
-							apiKey: String(item.apiKey).trim(),
-							allowWrites: typeof item.allowWrites === 'boolean' ? item.allowWrites : undefined,
-							readOnly: typeof item.readOnly === 'boolean' ? item.readOnly : undefined,
-							baseUrl: typeof item.baseUrl === 'string' ? item.baseUrl : undefined,
-						});
-					}
-				}
-			}
-		} catch (error) {
-			console.error('Warning: Failed to parse LEXWARE_OFFICE_ACCOUNTS_JSON:', error);
+	if (accountsJson !== undefined && accountsJson.trim().length > 0) {
+		for (const account of parseAccountList(accountsJson, 'LEXWARE_OFFICE_ACCOUNTS_JSON')) {
+			addAccount(account, 'LEXWARE_OFFICE_ACCOUNTS_JSON');
 		}
 	}
 
-	// 3. Explicit list or auto-discovery in environment variables
-	const explicitList = process.env.LEXWARE_OFFICE_ACCOUNTS
-		? process.env.LEXWARE_OFFICE_ACCOUNTS.split(',').map((s) => s.trim()).filter(Boolean)
-		: [];
-
-	const candidateIds = new Set<string>(explicitList.map(normalizeAccountId));
+	// 3. Named environment variables: LEXWARE_OFFICE_API_KEY_<ID> (+ optional explicit LEXWARE_OFFICE_ACCOUNTS list)
+	const prefix = 'LEXWARE_OFFICE_API_KEY_';
+	const envSuffixById = new Map<string, string>();
 	for (const key of Object.keys(process.env)) {
-		if (key.startsWith('LEXWARE_OFFICE_API_KEY_')) {
-			const rawId = key.slice('LEXWARE_OFFICE_API_KEY_'.length);
-			if (rawId.length > 0) {
-				candidateIds.add(normalizeAccountId(rawId));
-			}
+		if (!key.startsWith(prefix) || key.length === prefix.length) continue;
+		const suffix = key.slice(prefix.length);
+		const id = normalizeAccountId(suffix);
+		const existing = envSuffixById.get(id);
+		if (existing !== undefined && existing !== suffix) {
+			throw new Error(`Environment variables ${prefix}${existing} and ${prefix}${suffix} both normalize to account id '${id}'`);
+		}
+		envSuffixById.set(id, suffix);
+	}
+	const explicitList = (process.env.LEXWARE_OFFICE_ACCOUNTS ?? '')
+		.split(',')
+		.map((s) => s.trim())
+		.filter(Boolean)
+		.map(normalizeAccountId);
+	for (const id of explicitList) {
+		if (!envSuffixById.has(id) && !accounts.some((existing) => existing.id === id)) {
+			throw new Error(`Account '${id}' is listed in LEXWARE_OFFICE_ACCOUNTS but ${prefix}${id.toUpperCase()} is not set`);
 		}
 	}
-
-	for (const id of candidateIds) {
-		if (seenIds.has(id)) continue;
-		const upper = id.toUpperCase();
-		const apiKey = process.env[`LEXWARE_OFFICE_API_KEY_${upper}`] ?? process.env[`LEXWARE_OFFICE_API_KEY_${id}`];
-		if (apiKey && apiKey.trim().length > 0) {
-			seenIds.add(id);
-			const name = process.env[`LEXWARE_OFFICE_NAME_${upper}`] ?? process.env[`LEXWARE_OFFICE_NAME_${id}`] ?? id;
-			const allowWritesEnv = process.env[`LEXWARE_OFFICE_ALLOW_WRITES_${upper}`] ?? process.env[`LEXWARE_OFFICE_ALLOW_WRITES_${id}`];
-			const readOnlyEnv = process.env[`LEXWARE_OFFICE_READ_ONLY_${upper}`] ?? process.env[`LEXWARE_OFFICE_READ_ONLY_${id}`];
-
-			accounts.push({
-				id,
-				name,
-				apiKey: apiKey.trim(),
-				allowWrites: allowWritesEnv !== undefined ? allowWritesEnv === 'true' : undefined,
-				readOnly: readOnlyEnv !== undefined ? readOnlyEnv === 'true' : undefined,
-			});
+	for (const [id, suffix] of envSuffixById) {
+		const apiKey = process.env[`${prefix}${suffix}`]?.trim();
+		if (!apiKey) {
+			throw new Error(`${prefix}${suffix} is empty`);
 		}
+		const allowWritesEnv = process.env[`LEXWARE_OFFICE_ALLOW_WRITES_${suffix}`];
+		const readOnlyEnv = process.env[`LEXWARE_OFFICE_READ_ONLY_${suffix}`];
+		addAccount({
+			id,
+			name: process.env[`LEXWARE_OFFICE_NAME_${suffix}`] ?? id,
+			apiKey,
+			allowWrites: allowWritesEnv !== undefined ? allowWritesEnv === 'true' : undefined,
+			readOnly: readOnlyEnv !== undefined ? readOnlyEnv === 'true' : undefined,
+		}, `${prefix}${suffix}`);
 	}
 
 	// 4. Single-account legacy fallback
-	const legacyApiKey = process.env.LEXWARE_OFFICE_API_KEY;
-	if (legacyApiKey && legacyApiKey.trim().length > 0 && accounts.length === 0) {
-		const id = 'default';
-		seenIds.add(id);
-		accounts.push({
-			id,
+	const legacyApiKey = process.env.LEXWARE_OFFICE_API_KEY?.trim();
+	if (legacyApiKey && accounts.length === 0) {
+		addAccount({
+			id: 'default',
 			name: process.env.LEXWARE_OFFICE_ACCOUNT_NAME ?? 'Default Account',
-			apiKey: legacyApiKey.trim(),
-			allowWrites: process.env.LEXWARE_OFFICE_ALLOW_WRITES === 'true',
-			readOnly: process.env.LEXWARE_OFFICE_READ_ONLY === 'true',
-		});
+			apiKey: legacyApiKey,
+		}, 'LEXWARE_OFFICE_API_KEY');
 	}
 
-	const defaultAccountId = process.env.LEXWARE_OFFICE_DEFAULT_ACCOUNT
-		? normalizeAccountId(process.env.LEXWARE_OFFICE_DEFAULT_ACCOUNT)
-		: accounts[0]?.id;
+	// The global LEXWARE_OFFICE_ALLOW_WRITES only applies to single-account setups.
+	// With 2+ accounts every account must opt in to writes on its own.
+	if (accounts.length > 1) {
+		for (const account of accounts) {
+			if (account.allowWrites === undefined) account.allowWrites = false;
+		}
+	}
+
+	const rawDefault = process.env.LEXWARE_OFFICE_DEFAULT_ACCOUNT?.trim();
+	const defaultAccountId = rawDefault ? normalizeAccountId(rawDefault) : accounts[0]?.id;
+	if (defaultAccountId !== undefined && !accounts.some((account) => account.id === defaultAccountId)) {
+		throw new Error(`LEXWARE_OFFICE_DEFAULT_ACCOUNT '${defaultAccountId}' does not match a configured account. Available accounts: [${accounts.map((a) => a.id).join(', ')}]`);
+	}
 
 	return { accounts, defaultAccountId };
 }
 
+function parseAccountList(json: string, source: string): AccountConfig[] {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(json);
+	} catch {
+		// Deliberately omit the parser message: it can quote config contents, including API keys.
+		throw new Error(`${source} is not valid JSON`);
+	}
+	const list = Array.isArray(parsed)
+		? parsed
+		: parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).accounts)
+			? (parsed as Record<string, unknown>).accounts as unknown[]
+			: undefined;
+	if (list === undefined) {
+		throw new Error(`${source} must be a JSON array of accounts or an object with an "accounts" array`);
+	}
+	return list.map((item, index) => {
+		if (!item || typeof item !== 'object' || Array.isArray(item)) {
+			throw new Error(`${source} entry #${index + 1} must be an object`);
+		}
+		const entry = item as Record<string, unknown>;
+		if (typeof entry.apiKey !== 'string' || entry.apiKey.trim().length === 0) {
+			throw new Error(`${source} entry #${index + 1} is missing a non-empty string apiKey`);
+		}
+		const rawId = typeof entry.id === 'string' && entry.id.trim().length > 0
+			? entry.id
+			: typeof entry.name === 'string' && entry.name.trim().length > 0 ? entry.name : undefined;
+		if (rawId === undefined) {
+			throw new Error(`${source} entry #${index + 1} needs an id`);
+		}
+		return {
+			id: normalizeAccountId(rawId),
+			name: typeof entry.name === 'string' ? entry.name : normalizeAccountId(rawId),
+			apiKey: entry.apiKey.trim(),
+			allowWrites: typeof entry.allowWrites === 'boolean' ? entry.allowWrites : undefined,
+			readOnly: typeof entry.readOnly === 'boolean' ? entry.readOnly : undefined,
+			baseUrl: typeof entry.baseUrl === 'string' ? entry.baseUrl : undefined,
+		};
+	});
+}
+
 function normalizeAccountId(raw: string): string {
 	return raw.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+}
+
+function validateBaseUrl(raw: string, accountId: string): string {
+	let url: URL;
+	try {
+		url = new URL(raw);
+	} catch {
+		throw new Error(`Invalid Lexware API base URL for account '${accountId}'`);
+	}
+	// The API key is sent as a bearer token; never allow it over plaintext HTTP.
+	if (url.protocol !== 'https:') {
+		throw new Error(`Lexware API base URL for account '${accountId}' must use https://`);
+	}
+	if (url.username || url.password) {
+		throw new Error(`Lexware API base URL for account '${accountId}' must not contain credentials`);
+	}
+	return url.origin;
 }
 
 function normalizeRequest(input: unknown): NormalizedRequest {
@@ -674,12 +744,61 @@ async function serializeRequestBody(request: NormalizedRequest, headers: Record<
 	throw new Error('Non-JSON request bodies must be strings or use rawBody=true with an explicit contentType.');
 }
 
-async function readUploadFile(contentPath: string): Promise<Buffer<ArrayBuffer>> {
+const ALLOWED_UPLOAD_EXTENSIONS = new Set(['.pdf', '.jpg', '.jpeg', '.png', '.xml']);
+
+function isInsideDirectory(directory: string, candidate: string): boolean {
+	const rel = relative(directory, candidate);
+	return rel.length > 0 && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+/**
+ * Host file reads are confined to LEXWARE_OFFICE_UPLOAD_DIR so sandbox code cannot
+ * read arbitrary files (e.g. the account config holding API keys). The lexical check
+ * runs before any filesystem access so paths outside the directory reveal nothing.
+ */
+async function resolveUploadPath(contentPath: string): Promise<string> {
+	const uploadDir = process.env.LEXWARE_OFFICE_UPLOAD_DIR?.trim();
+	if (!uploadDir) {
+		throw new Error('multipart contentPath uploads are disabled. Set LEXWARE_OFFICE_UPLOAD_DIR to a directory containing the files to upload, or use contentBase64.');
+	}
+	const resolvedDir = resolve(uploadDir);
+	const requested = resolve(contentPath);
+	if (!isInsideDirectory(resolvedDir, requested)) {
+		throw new Error(`multipart contentPath must be inside LEXWARE_OFFICE_UPLOAD_DIR (${resolvedDir})`);
+	}
+	if (!ALLOWED_UPLOAD_EXTENSIONS.has(extname(requested).toLowerCase())) {
+		throw new Error(`multipart contentPath must have one of the extensions ${Array.from(ALLOWED_UPLOAD_EXTENSIONS).join(', ')}`);
+	}
+
+	let realDir: string;
+	let realFile: string;
+	try {
+		realDir = await realpath(resolvedDir);
+		realFile = await realpath(requested);
+	} catch {
+		throw new Error(`multipart contentPath not found or not readable: ${contentPath}`);
+	}
+	// Re-check after resolving symlinks so a link inside the directory cannot point elsewhere.
+	if (!isInsideDirectory(realDir, realFile) || !ALLOWED_UPLOAD_EXTENSIONS.has(extname(realFile).toLowerCase())) {
+		throw new Error(`multipart contentPath must be inside LEXWARE_OFFICE_UPLOAD_DIR (${resolvedDir})`);
+	}
+	const configFile = process.env.LEXWARE_OFFICE_CONFIG_FILE?.trim();
+	if (configFile) {
+		const realConfig = await realpath(configFile).catch(() => resolve(configFile));
+		if (realConfig === realFile) {
+			throw new Error('multipart contentPath must not point at the Lexware account configuration file');
+		}
+	}
+	return realFile;
+}
+
+async function readUploadFile(requestedPath: string): Promise<Buffer<ArrayBuffer>> {
+	const contentPath = await resolveUploadPath(requestedPath);
 	let stats;
 	try {
 		stats = await stat(contentPath);
 	} catch {
-		throw new Error(`multipart contentPath not found or not readable: ${contentPath}`);
+		throw new Error(`multipart contentPath not found or not readable: ${requestedPath}`);
 	}
 	if (!stats.isFile()) {
 		throw new Error(`multipart contentPath must be a regular file: ${contentPath}`);
@@ -814,22 +933,6 @@ function sanitizeFetchErrorMessage(error: unknown, apiKey: string): string {
 		.replace(/https?:\/\/[^\s)]+/gi, '[url omitted]');
 }
 
-export function writesEnabled(): boolean {
-	return !writesAreGloballyDisabled();
-}
-
-function writesAreGloballyDisabled(): boolean {
-	// Hard block: READ_ONLY wins over everything.
-	if (process.env.LEXWARE_OFFICE_READ_ONLY === 'true') return true;
-	// Writes are blocked by default. Writes require explicit opt-in.
-	if (process.env.LEXWARE_OFFICE_ALLOW_WRITES === 'true') return false;
-	for (const key of Object.keys(process.env)) {
-		if (key.startsWith('LEXWARE_OFFICE_ALLOW_WRITES_') && process.env[key] === 'true') {
-			return false;
-		}
-	}
-	return true;
-}
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));

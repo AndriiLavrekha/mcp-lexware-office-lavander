@@ -43,7 +43,7 @@ The sandbox does **not** receive the Lexware API key, Node globals, filesystem a
 
 Uploads are binary-safe via `multipart` parts with `contentPath` (host reads a local file from disk), `contentBase64` (binary FormData parts), or `bodyBase64` (raw binary body). The host reads/decodes and builds `Buffer` / `Blob` bodies outside the QuickJS sandbox.
 
-Preferred: `contentPath` — pass the file's absolute path instead of inlining bytes. Requires `LEXWARE_OFFICE_ALLOW_WRITES=true` (uploads are writes) and works only when the MCP server runs on the machine that has the file:
+Preferred: `contentPath` — pass the file's absolute path instead of inlining bytes. Uploads are writes, so the target account must allow writes. `contentPath` is disabled unless `LEXWARE_OFFICE_UPLOAD_DIR` is set; the file must resolve inside that directory and be a `.pdf`, `.jpg`, `.jpeg`, `.png`, or `.xml`. It works only when the MCP server runs on the machine that has the file:
 
 ```js
 async () => {
@@ -99,6 +99,14 @@ Run the packaged binary from the latest GitHub release (`#semver:^2` resolves to
 The server supports connecting to multiple Lexware Office accounts simultaneously (e.g. for sole proprietors in Germany running both a **Freelance / Freiberufler** practice and a **Gewerbe / Commercial enterprise**, or managing multiple businesses).
 
 Inside sandboxed code, the agent can query accounts individually (`lexware.freelance`, `lexware.account('gewerbe')`) or consolidate data across all connected accounts in parallel (`lexware.allAccounts(...)`).
+
+Safety rules with two or more accounts:
+
+- Each account must opt in to writes on its own (`LEXWARE_OFFICE_ALLOW_WRITES_<ID>=true` or `"allowWrites": true`); the global `LEXWARE_OFFICE_ALLOW_WRITES` only applies to single-account setups. A global `LEXWARE_OFFICE_READ_ONLY=true` blocks writes on every account.
+- Writes must name their account explicitly; reads without an account use `LEXWARE_OFFICE_DEFAULT_ACCOUNT` (or the first account).
+- Any configuration error (invalid JSON, duplicate or reserved id, unknown default account, non-`https` `baseUrl`) stops the server at startup.
+
+See [docs/guide.md#multi-account--cross-account-consolidation](docs/guide.md#multi-account--cross-account-consolidation) for details.
 
 #### Option A: Named Environment Variables
 
@@ -193,7 +201,7 @@ Use this source-based setup only for development. End users should prefer the pa
 }
 ```
 
-See [docs/guide.md#permissions](docs/guide.md#permissions) for the detailed permission model.
+See [docs/guide.md#permissions](docs/guide.md#permissions) for the detailed permission model, and [docs/guide.md#handling-sensitive-data](docs/guide.md#handling-sensitive-data) before connecting real bookkeeping data.
 
 ## Docker
 

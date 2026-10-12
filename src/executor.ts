@@ -143,30 +143,19 @@ export class QuickJsExecutor implements CodeExecutor {
   const __capabilities = JSON.parse(globalThis.__capabilitiesJson);
   const { spec } = __capabilities;
   const accounts = Array.isArray(__capabilities.accounts) ? __capabilities.accounts : [];
-  const defaultAccountId = typeof __capabilities.defaultAccountId === "string" && __capabilities.defaultAccountId.length > 0
-    ? __capabilities.defaultAccountId
-    : (accounts[0] ? accounts[0].id : undefined);
 
   const lexware = typeof globalThis.__lexwareRequestJson === "function"
     ? (() => {
         const isObjectLike = (value) => value !== null && typeof value === "object";
 
+        // Only explicit selections are forwarded. The host applies the default
+        // account and rejects writes without an explicit account when 2+ exist.
         const resolveTargetAccount = (input, accountOverride) => {
           if (typeof accountOverride === "string" && accountOverride.length > 0) {
             return accountOverride;
           }
           if (isObjectLike(input) && typeof input.account === "string" && input.account.length > 0) {
             return input.account;
-          }
-          if (defaultAccountId) {
-            return defaultAccountId;
-          }
-          if (accounts.length === 1) {
-            return accounts[0].id;
-          }
-          if (accounts.length > 1) {
-            const list = accounts.map(a => a.id).join(", ");
-            throw new Error("Multiple Lexware accounts configured (" + list + "). Please specify the account: lexware.account('id').request(...) or { account: 'id', path: '...' }");
           }
           return undefined;
         };
@@ -260,7 +249,8 @@ export class QuickJsExecutor implements CodeExecutor {
           });
         };
 
-        const accountClientsMap = {};
+        // Null prototype so ids like "constructor" never resolve to Object.prototype members.
+        const accountClientsMap = Object.create(null);
         for (const meta of accounts) {
           accountClientsMap[meta.id] = createAccountClient(meta);
         }
@@ -407,14 +397,10 @@ export class QuickJsExecutor implements CodeExecutor {
           formatMoney,
         };
 
-        const reservedKeys = new Set([
-          "accounts", "account", "allAccounts", "mapAccounts",
-          "request", "json", "paginate",
-          "requireNumber", "requireMoney", "sumMoney", "formatMoney"
-        ]);
+        // Shorthand lexware.<id>; never shadow built-in members or prototype keys.
         for (const meta of accounts) {
-          if (!reservedKeys.has(meta.id)) {
-            baseLexware[meta.id] = accountClientsMap[meta.id];
+          if (!(meta.id in baseLexware)) {
+            Object.defineProperty(baseLexware, meta.id, { value: accountClientsMap[meta.id], enumerable: true });
           }
         }
 
@@ -427,7 +413,7 @@ export class QuickJsExecutor implements CodeExecutor {
   }
   return await __userFunction();
 })()
-\`;
+`;
 
 			const evaluation = vm.evalCode(wrappedCode, filename, { type: 'global' });
 			if (evaluation.error) {

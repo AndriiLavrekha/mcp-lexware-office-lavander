@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 import { QuickJsExecutor } from './executor.js';
-import { LexwareClientRegistry, loadAccountsFromEnv, writesEnabled } from './lexware-client.js';
+import { LexwareClientRegistry, loadAccountsFromEnv } from './lexware-client.js';
 import { lexwareSpec } from './lexware-spec.js';
 import { stringifyForMcp } from './truncate.js';
 import { VERSION } from './version.js';
@@ -17,17 +17,24 @@ const server = new McpServer({
 const searchExecutor = new QuickJsExecutor();
 const executeExecutor = new QuickJsExecutor();
 
-const { accounts, defaultAccountId } = loadAccountsFromEnv();
+// Misconfigured accounts are fatal: never fall back to a different account source.
 // Use a shorter per-request timeout than the executor timeout (30 s) so that
 // slow Lexware requests fail with a clean error before the sandbox is torn down.
-const registry = new LexwareClientRegistry(accounts, defaultAccountId, { requestTimeoutMs: 25_000 });
+let registry: LexwareClientRegistry;
+try {
+	const { accounts, defaultAccountId } = loadAccountsFromEnv();
+	registry = new LexwareClientRegistry(accounts, defaultAccountId, { requestTimeoutMs: 25_000 });
+} catch (error) {
+	console.error(`Lexware Office MCP server configuration error: ${error instanceof Error ? error.message : String(error)}`);
+	process.exit(1);
+}
 
 // Inject the current write mode and accounts metadata so callers can branch before attempting a write.
 const sandboxSpec = () => ({
 	...lexwareSpec,
 	info: {
 		...lexwareSpec.info,
-		writesEnabled: writesEnabled(),
+		writesEnabled: registry.anyWritesEnabled(),
 		accounts: registry.listAccounts(),
 		defaultAccountId: registry.defaultAccountId,
 	},
@@ -46,7 +53,7 @@ declare const spec: LexwareApiCatalog;
 Useful starting points:
 - spec.info.accounts: list of configured Lexware accounts ({ id, name, writesEnabled })
 - spec.info.domainIndex: compact map from business domains to endpoint lists
-- spec.info.writesEnabled: whether this server currently allows POST/PUT/PATCH/DELETE — check before planning writes
+- spec.info.writesEnabled: whether any configured account allows POST/PUT/PATCH/DELETE — check spec.info.accounts[].writesEnabled for the target account before planning writes
 - spec.paths: path -> method -> operation catalog with params, requestBody, responses, examples, capabilities, docsUrl
 - spec.workflows: curated recipes for reporting, sales documents, files/uploads, webhooks, and API quirks
 - spec.info.voucherStatusSemantics and financeReportingSemantics: finance/status guidance for revenue/Umsatz/profit questions
@@ -70,7 +77,6 @@ async () => {
 			{
 				spec: sandboxSpec(),
 				accounts: registry.listAccounts(),
-				defaultAccountId: registry.defaultAccountId,
 			},
 			{ timeoutMs: 1_000, memoryLimitBytes: 32 * 1024 * 1024, maxStackSizeBytes: 1024 * 1024, filename: 'lexware-search.js' },
 		);
@@ -137,7 +143,7 @@ interface LexwareAccountClient {
 }
 
 type LexwareRequest = {
-  account?: string; // target account ID (e.g. 'freelance', 'gewerbe'); defaults to primary account if omitted
+  account?: string; // target account ID (e.g. 'freelance', 'gewerbe'); reads default to the primary account, writes MUST name it when multiple accounts exist
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   path: string; // relative /v1/... only; no absolute URLs or // hosts
   query?: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>;
@@ -154,7 +160,7 @@ type MultipartPart = {
   name: string;
   value?: string; // plain text form field
   contentBase64?: string; // binary part content as base64; host decodes it
-  contentPath?: string; // absolute file path on the MCP server machine; host reads the file directly — preferred for local files (no base64, no size blowup)
+  contentPath?: string; // absolute path to a .pdf/.jpg/.jpeg/.png/.xml file inside the operator-configured upload directory on the MCP server machine; host reads it directly (no base64, no size blowup). Fails if no upload directory is configured.
   filename?: string; // defaults to the contentPath basename
   contentType?: string;
 };
@@ -178,7 +184,7 @@ type LexwareResponse<T = unknown> = {
 
 lexware.request returns all HTTP responses, including non-OK, as LexwareResponse. Check response.ok/status for recovery logic, or use lexware.json(...) / lexware.paginate(...) when you want non-OK or non-JSON responses to throw.
 
-This server is read-only by default. POST, PUT, PATCH, and DELETE are blocked unless permitted for the account. Check client.writesEnabled or spec.info.writesEnabled to branch before attempting a write.
+This server is read-only by default. POST, PUT, PATCH, and DELETE are blocked unless permitted for the account. Check client.writesEnabled (or spec.info.accounts[].writesEnabled) to branch before attempting a write. When multiple accounts are configured, writes without an explicit account are rejected — use lexware.account('id').request(...) or { account: 'id', ... }. maxRequests is shared across all accounts in one execution.
 
 Multi-account consolidation example (e.g. combining revenue across accounts):
 
@@ -203,7 +209,7 @@ async () => {
 			.max(50)
 			.optional()
 			.default(10)
-			.describe('Maximum number of Lexware API requests this execution may perform.'),
+			.describe('Maximum number of Lexware API requests this execution may perform, across all accounts.'),
 	},
 	async ({ code, maxRequests }) => {
 		let requestCount = 0;
@@ -212,7 +218,6 @@ async () => {
 			{
 				spec: sandboxSpec(),
 				accounts: registry.listAccounts(),
-				defaultAccountId: registry.defaultAccountId,
 			},
 			{
 				timeoutMs: 30_000,
@@ -236,7 +241,7 @@ async () => {
 							accountId = (parsed as { account?: string })?.account;
 							requestData = parsed;
 						}
-						const client = registry.get(accountId);
+						const client = registry.resolve(accountId, requestData);
 						const response = await client.request(requestData);
 						return JSON.stringify(response);
 					},
