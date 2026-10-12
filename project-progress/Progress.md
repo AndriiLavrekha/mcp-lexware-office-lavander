@@ -1,6 +1,6 @@
 ---
-gate_deploy: not-started
-gate_review: not-started
+gate_deploy: blocked
+gate_review: done
 gate_tests: done
 gate_implementation: done
 project: mcp-lexware-office
@@ -23,19 +23,19 @@ commit_progress: true
 
 ## Resume Snapshot
 
-Multi-account hardening complete and independently reviewed. Branch `fix/multi-account-hardening` merged into `main` locally; push to origin is blocked until the user re-authenticates GitHub (gh auth login), then git push origin main. Review-agent findings (null-account envelope bypass, env-order default account, lax boolean flags, case-sensitive per-account env lookup, silent legacy key drop, upload TOCTOU/hard links, test env handling, Docker pin/docs) all fixed with tests. Verified: typecheck, 92/92 tests, Docker build + smoke, stdio E2E. Next: user tests the MCP with multiple real Lexware accounts (start read-only, then enable writes per account). Key files: src/lexware-client.ts, src/multi-account.test.ts, docs/guide.md.
+Multi-account hardening complete and independently reviewed. Branch `fix/multi-account-hardening` merged into `main` and pushed to origin (0c3b9f1). No GitHub Actions run appeared for the push; Actions on the fork may need enabling in the repo Actions tab. Review-agent findings (null-account envelope bypass, env-order default account, lax boolean flags, case-sensitive per-account env lookup, silent legacy key drop, upload TOCTOU/hard links, test env handling, Docker pin/docs) all fixed with tests. Verified: typecheck, 92/92 tests, Docker build + smoke, stdio E2E. Next: user tests the MCP with multiple real Lexware accounts (start read-only, then enable writes per account). Key files: src/lexware-client.ts, src/multi-account.test.ts, docs/guide.md.
 
 ## Current State
 
-Merged to main locally; push blocked by invalid GitHub token.
+Merged and pushed; awaiting real multi-account testing by user.
 
 ## Last Session
 
-Independent review, fixed all findings, merged to main; push failed (auth).
+Independent review, fixed all findings, merged and pushed after re-auth (workflow scope).
 
 ## Next Action
 
-User re-authenticates GitHub and pushes main, then tests the MCP with multiple real Lexware accounts (read-only first).
+User tests the MCP with multiple real Lexware accounts (read-only first).
 
 ## Remaining Work
 
@@ -49,7 +49,7 @@ User re-authenticates GitHub and pushes main, then tests the MCP with multiple r
 
 ## Blockers
 
-GitHub push auth: keyring token invalid (gh auth login -h github.com).
+None.
 
 ## Deployment
 
