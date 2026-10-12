@@ -3,10 +3,21 @@ import test from 'node:test';
 
 import { QuickJsExecutor } from './executor.js';
 import {
+	createSandboxRequestHandler,
 	LexwareClientRegistry,
 	loadAccountsFromEnv,
+	parseSandboxRequestEnvelope,
 	type AccountConfig,
 } from './lexware-client.js';
+
+// Restore keys in place: assigning a new object to process.env would replace Node's
+// special env object (losing e.g. Windows case-insensitivity) for the rest of the run.
+const restoreEnv = (original: NodeJS.ProcessEnv) => {
+	for (const key of Object.keys(process.env)) {
+		if (!(key in original)) delete process.env[key];
+	}
+	Object.assign(process.env, original);
+};
 
 test('loadAccountsFromEnv: single legacy key maps to default account', () => {
 	const originalEnv = { ...process.env };
@@ -22,7 +33,7 @@ test('loadAccountsFromEnv: single legacy key maps to default account', () => {
 		assert.equal(accounts[0].apiKey, 'test-single-key');
 		assert.equal(defaultAccountId, 'default');
 	} finally {
-		process.env = originalEnv;
+		restoreEnv(originalEnv);
 	}
 });
 
@@ -60,7 +71,7 @@ test('loadAccountsFromEnv: discovers prefixed environment variables', () => {
 
 		assert.equal(defaultAccountId, 'freelance');
 	} finally {
-		process.env = originalEnv;
+		restoreEnv(originalEnv);
 	}
 });
 
@@ -83,7 +94,7 @@ test('loadAccountsFromEnv: parses LEXWARE_OFFICE_ACCOUNTS_JSON', () => {
 		assert.equal(accounts[2].id, 'youtube');
 		assert.equal(defaultAccountId, 'freelance');
 	} finally {
-		process.env = originalEnv;
+		restoreEnv(originalEnv);
 	}
 });
 
@@ -217,7 +228,7 @@ const withEnv = (vars: Record<string, string>, fn: () => void) => {
 		Object.assign(process.env, vars);
 		fn();
 	} finally {
-		process.env = originalEnv;
+		restoreEnv(originalEnv);
 	}
 };
 
@@ -385,5 +396,105 @@ test('QuickJsExecutor: only explicit account selections reach the host; prototyp
 		errors: ['constructor:true', '__proto__:true', 'toString:true', 'missing:true'],
 		shorthand: 'function',
 		keys: ['freelance', 'gewerbe'],
+	});
+});
+
+test('host request handler: null, empty, or non-string accounts never fall back to the default for writes', async () => {
+	const calls: string[] = [];
+	const registry = new LexwareClientRegistry([
+		{ id: 'a', apiKey: 'k1', allowWrites: true },
+		{ id: 'b', apiKey: 'k2', allowWrites: true },
+	], 'a', {
+		rateLimitIntervalMs: 0,
+		fetchImpl: async (input) => {
+			calls.push(String(input));
+			return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+		},
+	});
+	const { handler, requestCount } = createSandboxRequestHandler(registry, 10);
+	const post = { method: 'POST', path: '/v1/contacts', body: {} };
+
+	await assert.rejects(() => handler(JSON.stringify({ account: null, request: post })), /account must be a non-empty account id string/);
+	await assert.rejects(() => handler(JSON.stringify({ account: '', request: post })), /account must be a non-empty account id string/);
+	await assert.rejects(() => handler(JSON.stringify({ account: 42, request: post })), /account must be a non-empty account id string/);
+	await assert.rejects(() => handler(JSON.stringify({ request: { ...post, account: null } })), /request\.account must be a non-empty/);
+	await assert.rejects(() => handler(JSON.stringify({ request: post })), /must name the target account/);
+	await assert.rejects(() => handler(JSON.stringify(post)), /must be an object of the form/);
+	await assert.rejects(() => handler('not json'), /payload must be JSON/);
+	await assert.rejects(() => handler(JSON.stringify({ account: 'a', request: { ...post, account: 'b' } })), /Conflicting account selection/);
+	assert.equal(calls.length, 0);
+
+	await handler(JSON.stringify({ request: { ...post, account: 'b' } }));
+	await handler(JSON.stringify({ request: { path: '/v1/contacts' } }));
+	assert.equal(calls.length, 2);
+	assert.equal(requestCount(), 10);
+});
+
+test('host request handler enforces maxRequests across accounts', async () => {
+	const registry = new LexwareClientRegistry([
+		{ id: 'a', apiKey: 'k1' },
+		{ id: 'b', apiKey: 'k2' },
+	], 'a', {
+		rateLimitIntervalMs: 0,
+		fetchImpl: async () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }),
+	});
+	const { handler } = createSandboxRequestHandler(registry, 2);
+	await handler(JSON.stringify({ account: 'a', request: { path: '/v1/contacts' } }));
+	await handler(JSON.stringify({ account: 'b', request: { path: '/v1/contacts' } }));
+	await assert.rejects(() => handler(JSON.stringify({ account: 'a', request: { path: '/v1/contacts' } })), /exceeded maxRequests=2/);
+});
+
+test('parseSandboxRequestEnvelope accepts the shapes the sandbox sends', () => {
+	assert.deepEqual(parseSandboxRequestEnvelope(JSON.stringify({ request: { path: '/v1/x' } })), { accountId: undefined, request: { path: '/v1/x' } });
+	assert.deepEqual(parseSandboxRequestEnvelope(JSON.stringify({ account: 'a', request: { path: '/v1/x', account: 'a' } })).accountId, 'a');
+});
+
+test('env-defined accounts are ordered by LEXWARE_OFFICE_ACCOUNTS, then by id', () => {
+	withEnv({ LEXWARE_OFFICE_ACCOUNTS: 'zeta,alpha', LEXWARE_OFFICE_API_KEY_ALPHA: 'k1', LEXWARE_OFFICE_API_KEY_ZETA: 'k2', LEXWARE_OFFICE_API_KEY_MID: 'k3' }, () => {
+		const { accounts, defaultAccountId } = loadAccountsFromEnv();
+		assert.deepEqual(accounts.map((a) => a.id), ['zeta', 'alpha', 'mid']);
+		assert.equal(defaultAccountId, 'zeta');
+	});
+	withEnv({ LEXWARE_OFFICE_API_KEY_ZETA: 'k2', LEXWARE_OFFICE_API_KEY_ALPHA: 'k1' }, () => {
+		const { accounts, defaultAccountId } = loadAccountsFromEnv();
+		assert.deepEqual(accounts.map((a) => a.id), ['alpha', 'zeta']);
+		assert.equal(defaultAccountId, 'alpha');
+	});
+});
+
+test('boolean flags are parsed strictly and fail closed', () => {
+	withEnv({ LEXWARE_OFFICE_API_KEY_SHOP: 'k1', LEXWARE_OFFICE_READ_ONLY_SHOP: 'yes' }, () => {
+		assert.throws(() => loadAccountsFromEnv(), /LEXWARE_OFFICE_READ_ONLY_SHOP must be "true" or "false"/);
+	});
+	withEnv({ LEXWARE_OFFICE_API_KEY: 'k1', LEXWARE_OFFICE_READ_ONLY: 'on' }, () => {
+		assert.throws(() => loadAccountsFromEnv(), /LEXWARE_OFFICE_READ_ONLY must be "true" or "false"/);
+	});
+	withEnv({ LEXWARE_OFFICE_ACCOUNTS_JSON: JSON.stringify([{ id: 'a', apiKey: 'k1', readOnly: 'true' }]) }, () => {
+		assert.throws(() => loadAccountsFromEnv(), /readOnly must be true or false \(JSON boolean/);
+	});
+	withEnv({ LEXWARE_OFFICE_API_KEY_SHOP: 'k1', LEXWARE_OFFICE_ALLOW_WRITES: 'TRUE', LEXWARE_OFFICE_READ_ONLY_SHOP: '1' }, () => {
+		const { accounts } = loadAccountsFromEnv();
+		assert.equal(accounts[0].readOnly, true);
+		assert.equal(new LexwareClientRegistry(accounts).get('shop').writesEnabled(), false);
+	});
+	withEnv({ LEXWARE_OFFICE_API_KEY: 'k1', LEXWARE_OFFICE_ALLOW_WRITES: 'TRUE', LEXWARE_OFFICE_READ_ONLY: '1' }, () => {
+		const { accounts } = loadAccountsFromEnv();
+		assert.equal(new LexwareClientRegistry(accounts).get().writesEnabled(), false);
+	});
+});
+
+test('per-account variables are matched case-insensitively', () => {
+	withEnv({ LEXWARE_OFFICE_API_KEY_shop: 'k1', LEXWARE_OFFICE_READ_ONLY_SHOP: 'true', LEXWARE_OFFICE_NAME_SHOP: 'Shop GmbH' }, () => {
+		const { accounts } = loadAccountsFromEnv();
+		assert.deepEqual(accounts.map((a) => [a.id, a.name, a.readOnly]), [['shop', 'Shop GmbH', true]]);
+	});
+});
+
+test('legacy LEXWARE_OFFICE_API_KEY cannot be silently dropped next to other accounts', () => {
+	withEnv({ LEXWARE_OFFICE_API_KEY: 'legacy', LEXWARE_OFFICE_API_KEY_SHOP: 'k1' }, () => {
+		assert.throws(() => loadAccountsFromEnv(), /LEXWARE_OFFICE_API_KEY cannot be combined/);
+	});
+	withEnv({ LEXWARE_OFFICE_API_KEY: 'legacy' }, () => {
+		assert.deepEqual(loadAccountsFromEnv().accounts.map((a) => a.id), ['default']);
 	});
 });

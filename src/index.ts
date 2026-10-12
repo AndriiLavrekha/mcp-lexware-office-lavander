@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 import { QuickJsExecutor } from './executor.js';
-import { LexwareClientRegistry, loadAccountsFromEnv } from './lexware-client.js';
+import { createSandboxRequestHandler, LexwareClientRegistry, loadAccountsFromEnv } from './lexware-client.js';
 import { lexwareSpec } from './lexware-spec.js';
 import { stringifyForMcp } from './truncate.js';
 import { VERSION } from './version.js';
@@ -212,7 +212,7 @@ async () => {
 			.describe('Maximum number of Lexware API requests this execution may perform, across all accounts.'),
 	},
 	async ({ code, maxRequests }) => {
-		let requestCount = 0;
+		const sandboxRequests = createSandboxRequestHandler(registry, maxRequests);
 		const execution = await executeExecutor.execute(
 			code,
 			{
@@ -225,26 +225,7 @@ async () => {
 				maxStackSizeBytes: 1024 * 1024,
 				filename: 'lexware-execute.js',
 				hostFunctions: {
-					__lexwareRequestJson: async (payload) => {
-						requestCount += 1;
-						if (requestCount > maxRequests) {
-							throw new Error(`Execution exceeded maxRequests=${maxRequests}`);
-						}
-						const parsed = JSON.parse(payload) as unknown;
-						let accountId: string | undefined;
-						let requestData: unknown;
-						if (parsed && typeof parsed === 'object' && 'request' in parsed) {
-							const envelope = parsed as { account?: string; request: unknown };
-							accountId = envelope.account;
-							requestData = envelope.request;
-						} else {
-							accountId = (parsed as { account?: string })?.account;
-							requestData = parsed;
-						}
-						const client = registry.resolve(accountId, requestData);
-						const response = await client.request(requestData);
-						return JSON.stringify(response);
-					},
+					__lexwareRequestJson: sandboxRequests.handler,
 				},
 			},
 		);
@@ -254,7 +235,7 @@ async () => {
 				content: [
 					{
 						type: 'text',
-						text: stringifyForMcp({ ok: false, error: execution.error, logs: execution.logs ?? [], requestCount }),
+						text: stringifyForMcp({ ok: false, error: execution.error, logs: execution.logs ?? [], requestCount: sandboxRequests.requestCount() }),
 					},
 				],
 				isError: true,
@@ -265,7 +246,7 @@ async () => {
 			content: [
 				{
 					type: 'text',
-					text: stringifyForMcp({ ok: true, result: execution.result, logs: execution.logs ?? [], requestCount }),
+					text: stringifyForMcp({ ok: true, result: execution.result, logs: execution.logs ?? [], requestCount: sandboxRequests.requestCount() }),
 				},
 			],
 		};

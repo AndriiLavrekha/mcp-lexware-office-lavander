@@ -12,7 +12,7 @@ provider_last_used: claude-code
 model_last_used: claude-opus-5-5
 effort_last_used: unknown
 updated: 2026-10-12
-last_milestone: multi-account security hardening implemented and verified
+last_milestone: independent review fixes merged to main
 deployed: false
 deployment_url:
 sensitivity: normal
@@ -23,23 +23,23 @@ commit_progress: true
 
 ## Resume Snapshot
 
-All review findings on commit b061d3c (multi-account support) are fixed on local branch `fix/multi-account-hardening` (not pushed). Commits: LF normalization (`.gitattributes`), then the hardening fix. Changes: executor build break fixed; global `LEXWARE_OFFICE_READ_ONLY` now always wins; with 2+ accounts writes need an explicit account (`LexwareClientRegistry.resolve`) and global `ALLOW_WRITES` no longer enables unflagged accounts; account config errors are fatal at startup with no config contents in messages; duplicate/reserved ids, unknown default account, non-https base URLs rejected; `contentPath` confined to `LEXWARE_OFFICE_UPLOAD_DIR` with extension allowlist and config-file denial; sandbox account map null-prototype; `spec.info.writesEnabled` from registry; Dockerfile non-root + frozen lockfile. Verified: typecheck, 85/85 tests, Docker build + container smoke, stdio E2E. Remaining: user review, push, PR/merge. Key files: `src/lexware-client.ts`, `src/multi-account.test.ts`.
+Multi-account hardening complete and independently reviewed. Branch `fix/multi-account-hardening` merged into `main` and pushed to origin. Review-agent findings (null-account envelope bypass, env-order default account, lax boolean flags, case-sensitive per-account env lookup, silent legacy key drop, upload TOCTOU/hard links, test env handling, Docker pin/docs) all fixed with tests. Verified: typecheck, 92/92 tests, Docker build + smoke, stdio E2E. Next: user tests the MCP with multiple real Lexware accounts (start read-only, then enable writes per account). Key files: src/lexware-client.ts, src/multi-account.test.ts, docs/guide.md.
 
 ## Current State
 
-Implementation done and verified locally; awaiting user review/push.
+Merged to main and pushed; awaiting real multi-account testing by user.
 
 ## Last Session
 
-Implemented and verified all hardening fixes from the review.
+Independent review, fixed all findings, merged and pushed.
 
 ## Next Action
 
-User reviews branch `fix/multi-account-hardening`, then push and open PR to main.
+User tests the MCP with multiple real Lexware accounts (read-only first).
 
 ## Remaining Work
 
-- [ ] Review, push, PR/merge (user decision).
+- [ ] Real-world multi-account testing.
 
 ## Done
 
@@ -60,7 +60,8 @@ Not deployed.
 - `pnpm run typecheck` and `pnpm test` pass. (met)
 - Every review finding in Tasks.md fixed with a test where applicable. (met)
 - README and docs/guide.md describe the new account/write/upload rules. (met)
-- Branch merged to main. (pending)
+- Branch merged to main. (met)
+- Real multi-account testing done. (pending)
 
 ## Verification
 

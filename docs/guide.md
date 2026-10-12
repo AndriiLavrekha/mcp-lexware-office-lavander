@@ -128,7 +128,7 @@ declare const lexware: {
 
 ## Multi-Account & Cross-Account Consolidation
 
-When connecting multiple Lexware Office accounts ($N \ge 1$), the server injects account discovery metadata and scoped clients into the sandboxed `execute` tool:
+With one or more connected Lexware Office accounts, the server injects account discovery metadata and scoped clients into the sandboxed `execute` tool:
 
 ```js
 async () => {
@@ -173,11 +173,13 @@ async () => {
 
 Account selection rules:
 
-- Reads without an account go to the default account (`LEXWARE_OFFICE_DEFAULT_ACCOUNT`, otherwise the first configured account).
+- Reads without an account go to the default account: `LEXWARE_OFFICE_DEFAULT_ACCOUNT`, otherwise the first configured account. Order: `LEXWARE_OFFICE_CONFIG_FILE` entries, then `LEXWARE_OFFICE_ACCOUNTS_JSON` entries (in file order), then `LEXWARE_OFFICE_API_KEY_<ID>` accounts in `LEXWARE_OFFICE_ACCOUNTS` order, then remaining ones alphabetically. Set `LEXWARE_OFFICE_DEFAULT_ACCOUNT` explicitly when you have several accounts.
+- Per-account flags depend on where the account is defined: `"allowWrites"` / `"readOnly"` (JSON booleans) for config-file and JSON accounts; `LEXWARE_OFFICE_ALLOW_WRITES_<ID>` / `LEXWARE_OFFICE_READ_ONLY_<ID>` / `LEXWARE_OFFICE_NAME_<ID>` (matched case-insensitively) only for `LEXWARE_OFFICE_API_KEY_<ID>` accounts.
+- `LEXWARE_OFFICE_API_KEY` (legacy single key) cannot be combined with other account sources; use `LEXWARE_OFFICE_API_KEY_DEFAULT` instead.
 - With two or more accounts, `POST`/`PUT`/`PATCH`/`DELETE` **must** name the account (`lexware.account('id')`, `lexware.<id>`, or `{ account: 'id', ... }`); otherwise the request is rejected, so writes never land in the wrong books by accident.
 - `maxRequests` is shared across all accounts in one `execute` call — raise it (max 50) for `allAccounts` + `paginate` reports.
 
-Account configuration is validated at startup and the server exits on any error instead of falling back to another source: invalid JSON, a missing `apiKey`, a duplicate id (ids are lowercased and non `[a-z0-9_-]` characters become `_`), an account listed in `LEXWARE_OFFICE_ACCOUNTS` without a key, an unknown `LEXWARE_OFFICE_DEFAULT_ACCOUNT`, a reserved id (`accounts`, `account`, `request`, `json`, `paginate`, `constructor`, `prototype`, `then`, or one starting with `_`), or a non-`https://` `baseUrl`. Error messages never include config contents.
+Account configuration is validated at startup and the server exits on any error instead of falling back to another source: invalid JSON, a missing `apiKey`, a duplicate id (ids are lowercased and non `[a-z0-9_-]` characters become `_`), an account listed in `LEXWARE_OFFICE_ACCOUNTS` without a key, an unknown `LEXWARE_OFFICE_DEFAULT_ACCOUNT`, a boolean flag that isn't `true`/`false`/`1`/`0`, a reserved id (`accounts`, `account`, `request`, `json`, `paginate`, `constructor`, `prototype`, `then`, or one starting with `_`), or a non-`https://` `baseUrl`. Error messages never include config contents.
 
 ## Binary-safe file uploads
 
@@ -203,7 +205,7 @@ async () => {
 }
 ```
 
-- `contentPath` is **disabled unless `LEXWARE_OFFICE_UPLOAD_DIR` is set**. The path must be absolute and resolve (after following symlinks) to a regular file inside that directory, with extension `.pdf`, `.jpg`, `.jpeg`, `.png`, or `.xml` (25 MB cap). The account config file (`LEXWARE_OFFICE_CONFIG_FILE`) is always refused. This keeps sandboxed code — which may be steered by prompt injection in Lexware data — from reading arbitrary host files.
+- `contentPath` is **disabled unless `LEXWARE_OFFICE_UPLOAD_DIR` is set**. The path must be absolute and resolve (after following symlinks) to a regular file inside that directory, with extension `.pdf`, `.jpg`, `.jpeg`, `.png`, or `.xml` (25 MB cap). The account config file (`LEXWARE_OFFICE_CONFIG_FILE`) and hard-linked files are always refused, and the file is re-checked after opening. Keep the directory writable only by you — not by other users or processes you don't trust. This keeps sandboxed code — which may be steered by prompt injection in Lexware data — from reading arbitrary host files.
 - `filename` defaults to the `contentPath` basename.
 - Uploads are writes: the target account must allow writes. Check `client.writesEnabled` to branch early.
 
@@ -287,6 +289,13 @@ To migrate a 1.x config:
 2. Use the `lexware-office` binary. (`lexware-office-v2` still works as a deprecated alias and prints a deprecation warning on startup.)
 3. Remove any `disabledTools` lists — permissioning is now env-based (see [Permissions](#permissions)).
 4. Writes are now blocked by default. Set `LEXWARE_OFFICE_ALLOW_WRITES=true` if you need create/update/finalize/upload operations.
+
+## Upgrading to multi-account hardening (breaking)
+
+- `multipart` `contentPath` uploads are **off by default**. Set `LEXWARE_OFFICE_UPLOAD_DIR` and keep the files to upload inside it (see [Binary-safe file uploads](#binary-safe-file-uploads)); `contentBase64` keeps working without it.
+- Boolean flags (`LEXWARE_OFFICE_READ_ONLY`, `LEXWARE_OFFICE_ALLOW_WRITES`, and their `_<ID>` variants) accept only `true`/`false`/`1`/`0` (any case); anything else stops the server instead of being ignored.
+- `LEXWARE_OFFICE_API_KEY` can no longer be combined with other account sources; rename it to `LEXWARE_OFFICE_API_KEY_DEFAULT` when adding accounts.
+- With two or more accounts, the global `LEXWARE_OFFICE_ALLOW_WRITES` no longer enables writes; opt in per account.
 
 Interaction pattern changes for the model:
 

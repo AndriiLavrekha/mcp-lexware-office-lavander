@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -43,7 +43,7 @@ test('server registers exactly search and execute tools', async () => {
 	assert.doesNotMatch(source, /get-revenue-summary|allowWrite/);
 	assert.match(source, /spec\.info\.domainIndex: compact map/);
 	assert.match(source, /lexware\.request returns all HTTP responses/);
-	assert.match(source, /registry\.resolve\(accountId, requestData\)/, 'execute must route through registry.resolve so 2+ account writes need an explicit account');
+	assert.match(source, /createSandboxRequestHandler\(registry, maxRequests\)/, 'execute must route sandbox requests through createSandboxRequestHandler');
 	assert.match(source, /process\.exit\(1\)/, 'account configuration errors must be fatal at startup');
 });
 
@@ -448,6 +448,14 @@ test('contentPath is confined to LEXWARE_OFFICE_UPLOAD_DIR with an extension all
 
 		process.env.LEXWARE_OFFICE_CONFIG_FILE = join(uploadDir, 'accounts.pdf');
 		await assert.rejects(() => upload(join(uploadDir, 'accounts.pdf')), /must not point at the Lexware account configuration file/);
+
+		// Directory junctions need no extra privileges on Windows (plain dir symlink elsewhere),
+		// so this escape case runs on every platform.
+		await symlink(root, join(uploadDir, 'escape'), 'junction');
+		await assert.rejects(() => upload(join(uploadDir, 'escape', 'secret.pdf')), /must be inside LEXWARE_OFFICE_UPLOAD_DIR/);
+
+		await link(outsideFile, join(uploadDir, 'hardlink.pdf'));
+		await assert.rejects(() => upload(join(uploadDir, 'hardlink.pdf')), /must not be a hard-linked file/);
 
 		let symlinkCreated = true;
 		try {

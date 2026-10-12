@@ -22,4 +22,6 @@ Security hardening of multi-account support (review of b061d3c). Branch: `fix/mu
 - [x] 12. Dockerfile: non-root user, frozen lockfile, pinned pnpm, node:22-alpine builder
 - [x] 13. Tests for all of the above; README + docs/guide.md updated
 - [x] 14. typecheck + full test run green (85/85); Docker build + stdio E2E verified
-- [ ] 15. User: review branch, push, open PR / merge to main
+- [x] 15. Independent review agent; all findings fixed (92/92 tests)
+- [x] 16. Merge to main and push
+- [ ] 17. User: test MCP with multiple real Lexware accounts

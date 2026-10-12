@@ -220,6 +220,17 @@ docker run -i --rm \
   mcp-lexware-office:latest
 ```
 
+The container runs as the unprivileged `node` user. To allow `contentPath` uploads, mount a directory read-only and point `LEXWARE_OFFICE_UPLOAD_DIR` at it:
+
+```bash
+docker run -i --rm \
+  -e LEXWARE_OFFICE_API_KEY \
+  -e LEXWARE_OFFICE_ALLOW_WRITES=true \
+  -e LEXWARE_OFFICE_UPLOAD_DIR=/uploads \
+  -v /path/to/receipts:/uploads:ro \
+  mcp-lexware-office:latest
+```
+
 ## Build and test
 
 ```bash

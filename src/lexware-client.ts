@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { constants as fsConstants, readFileSync } from 'node:fs';
+import { open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import { basename, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import { lexwareSpec, type HttpMethod, type LexwareOperation } from './lexware-spec.js';
@@ -152,10 +152,10 @@ export class LexwareApiClient {
 
 	writesEnabled(): boolean {
 		// Hard block: the global READ_ONLY wins over every per-account setting.
-		if (process.env.LEXWARE_OFFICE_READ_ONLY === 'true') return false;
+		if (readEnvFlag('LEXWARE_OFFICE_READ_ONLY') === true) return false;
 		if (this.readOnly === true) return false;
 		if (this.allowWrites !== undefined) return this.allowWrites;
-		return process.env.LEXWARE_OFFICE_ALLOW_WRITES === 'true';
+		return readEnvFlag('LEXWARE_OFFICE_ALLOW_WRITES') === true;
 	}
 
 	async request(input: unknown, _options: LexwareRequestOptions = {}): Promise<LexwareResponse> {
@@ -166,7 +166,7 @@ export class LexwareApiClient {
 
 		const normalized = normalizeRequest(input);
 		if (WRITE_METHODS.has(normalized.method) && !this.writesEnabled()) {
-			throw new Error(`${normalized.method} ${normalized.path} is blocked on account '${this.id}': writes are disabled by default. Enable them for this account (LEXWARE_OFFICE_ALLOW_WRITES_<ID>=true or allowWrites: true; LEXWARE_OFFICE_ALLOW_WRITES=true in single-account setups). LEXWARE_OFFICE_READ_ONLY=true overrides all of these.`);
+			throw new Error(`${normalized.method} ${normalized.path} is blocked on account '${this.id}': writes are disabled by default. Enable them in this account's configuration: "allowWrites": true for accounts from LEXWARE_OFFICE_CONFIG_FILE / LEXWARE_OFFICE_ACCOUNTS_JSON, LEXWARE_OFFICE_ALLOW_WRITES_<ID>=true for accounts from LEXWARE_OFFICE_API_KEY_<ID>, or LEXWARE_OFFICE_ALLOW_WRITES=true in single-account setups. LEXWARE_OFFICE_READ_ONLY=true overrides all of these.`);
 		}
 
 		await this.waitForRateLimitTurn();
@@ -257,7 +257,7 @@ export class LexwareClientRegistry {
 		}
 	}
 
-	get(accountId?: string): LexwareApiClient {
+	get(accountId?: string | null): LexwareApiClient {
 		const targetId = accountId ?? this.defaultAccountId;
 		if (!targetId) {
 			throw new Error('No Lexware accounts configured. Please provide LEXWARE_OFFICE_API_KEY or configure accounts via LEXWARE_OFFICE_ACCOUNTS_JSON / LEXWARE_OFFICE_ACCOUNTS.');
@@ -274,8 +274,8 @@ export class LexwareClientRegistry {
 	 * Resolves the client for a sandbox request. With 2+ accounts, writes must name
 	 * their account explicitly so they never land in the default account by accident.
 	 */
-	resolve(accountId: string | undefined, request: unknown): LexwareApiClient {
-		if (accountId === undefined && this.clients.size > 1) {
+	resolve(accountId: string | null | undefined, request: unknown): LexwareApiClient {
+		if (accountId == null && this.clients.size > 1) {
 			const method = request && typeof request === 'object' ? (request as { method?: unknown }).method : undefined;
 			if (typeof method === 'string' && WRITE_METHODS.has(method.toUpperCase() as LexwareExecuteMethod)) {
 				const available = Array.from(this.clients.keys()).join(', ');
@@ -304,6 +304,84 @@ export class LexwareClientRegistry {
 	get count(): number {
 		return this.clients.size;
 	}
+}
+
+/**
+ * Host side of the sandbox's `__lexwareRequestJson` global. Sandbox code can call that
+ * global directly, so the envelope is validated strictly here rather than trusted.
+ */
+export function createSandboxRequestHandler(registry: LexwareClientRegistry, maxRequests: number) {
+	let requestCount = 0;
+	const handler = async (payload: string): Promise<string> => {
+		requestCount += 1;
+		if (requestCount > maxRequests) {
+			throw new Error(`Execution exceeded maxRequests=${maxRequests}`);
+		}
+		const { accountId, request } = parseSandboxRequestEnvelope(payload);
+		const client = registry.resolve(accountId, request);
+		const response = await client.request(request);
+		return JSON.stringify(response);
+	};
+	return { handler, requestCount: () => requestCount };
+}
+
+export function parseSandboxRequestEnvelope(payload: string): { accountId?: string; request: unknown } {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(payload);
+	} catch {
+		throw new Error('lexware request payload must be JSON');
+	}
+	if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !('request' in parsed)) {
+		throw new Error('lexware request payload must be an object of the form { account?, request }');
+	}
+	const envelope = parsed as { account?: unknown; request: unknown };
+	const readAccount = (value: unknown, where: string): string | undefined => {
+		if (value === undefined) return undefined;
+		if (typeof value !== 'string' || value.length === 0) {
+			throw new Error(`${where} must be a non-empty account id string when provided`);
+		}
+		return value;
+	};
+	const outer = readAccount(envelope.account, 'account');
+	const inner = envelope.request && typeof envelope.request === 'object' && !Array.isArray(envelope.request)
+		? readAccount((envelope.request as { account?: unknown }).account, 'request.account')
+		: undefined;
+	if (outer !== undefined && inner !== undefined && outer !== inner) {
+		throw new Error(`Conflicting account selection: '${outer}' vs request.account '${inner}'`);
+	}
+	return { accountId: outer ?? inner, request: envelope.request };
+}
+
+const FLAG_TRUE = new Set(['true', '1']);
+const FLAG_FALSE = new Set(['false', '0']);
+
+function parseFlag(raw: string | undefined, name: string): boolean | undefined {
+	if (raw === undefined) return undefined;
+	const value = raw.trim().toLowerCase();
+	if (value.length === 0) return undefined;
+	if (FLAG_TRUE.has(value)) return true;
+	if (FLAG_FALSE.has(value)) return false;
+	throw new Error(`${name} must be "true" or "false"`);
+}
+
+/**
+ * Environment lookup that ignores case, matching Windows semantics everywhere.
+ * Throws if several spellings with different values exist (possible on Linux/macOS).
+ */
+function readEnv(name: string): string | undefined {
+	const upper = name.toUpperCase();
+	const keys = Object.keys(process.env).filter((key) => key.toUpperCase() === upper);
+	const values = new Set(keys.map((key) => process.env[key]));
+	if (values.size > 1) {
+		throw new Error(`Environment variables ${keys.join(', ')} differ only in letter case; keep exactly one`);
+	}
+	return keys.length > 0 ? process.env[keys[0]] : undefined;
+}
+
+/** Strictly parsed boolean environment flag: "true"/"1", "false"/"0", unset or empty; anything else throws. */
+export function readEnvFlag(name: string): boolean | undefined {
+	return parseFlag(readEnv(name), name);
 }
 
 // Ids that would collide with built-in members of the sandbox `lexware` object or object prototypes.
@@ -377,31 +455,44 @@ export function loadAccountsFromEnv(): { accounts: AccountConfig[]; defaultAccou
 			throw new Error(`Account '${id}' is listed in LEXWARE_OFFICE_ACCOUNTS but ${prefix}${id.toUpperCase()} is not set`);
 		}
 	}
-	for (const [id, suffix] of envSuffixById) {
-		const apiKey = process.env[`${prefix}${suffix}`]?.trim();
+	// Order: as listed in LEXWARE_OFFICE_ACCOUNTS, then the rest sorted by id. Never rely on
+	// process.env key order, which differs between platforms.
+	const envIds = [
+		...explicitList.filter((id, index) => envSuffixById.has(id) && explicitList.indexOf(id) === index),
+		...Array.from(envSuffixById.keys()).filter((id) => !explicitList.includes(id)).sort(),
+	];
+	for (const id of envIds) {
+		const suffix = envSuffixById.get(id) as string;
+		const upperSuffix = suffix.toUpperCase();
+		const apiKey = readEnv(`${prefix}${suffix}`)?.trim();
 		if (!apiKey) {
 			throw new Error(`${prefix}${suffix} is empty`);
 		}
-		const allowWritesEnv = process.env[`LEXWARE_OFFICE_ALLOW_WRITES_${suffix}`];
-		const readOnlyEnv = process.env[`LEXWARE_OFFICE_READ_ONLY_${suffix}`];
 		addAccount({
 			id,
-			name: process.env[`LEXWARE_OFFICE_NAME_${suffix}`] ?? id,
+			name: readEnv(`LEXWARE_OFFICE_NAME_${upperSuffix}`) ?? id,
 			apiKey,
-			allowWrites: allowWritesEnv !== undefined ? allowWritesEnv === 'true' : undefined,
-			readOnly: readOnlyEnv !== undefined ? readOnlyEnv === 'true' : undefined,
+			allowWrites: readEnvFlag(`LEXWARE_OFFICE_ALLOW_WRITES_${upperSuffix}`),
+			readOnly: readEnvFlag(`LEXWARE_OFFICE_READ_ONLY_${upperSuffix}`),
 		}, `${prefix}${suffix}`);
 	}
 
 	// 4. Single-account legacy fallback
 	const legacyApiKey = process.env.LEXWARE_OFFICE_API_KEY?.trim();
-	if (legacyApiKey && accounts.length === 0) {
+	if (legacyApiKey && accounts.length > 0) {
+		throw new Error('LEXWARE_OFFICE_API_KEY cannot be combined with other account sources. Rename it to LEXWARE_OFFICE_API_KEY_DEFAULT (or add it to your account JSON) to keep it as account \'default\'.');
+	}
+	if (legacyApiKey) {
 		addAccount({
 			id: 'default',
 			name: process.env.LEXWARE_OFFICE_ACCOUNT_NAME ?? 'Default Account',
 			apiKey: legacyApiKey,
 		}, 'LEXWARE_OFFICE_API_KEY');
 	}
+
+	// Fail at startup on malformed global flags instead of silently ignoring them.
+	readEnvFlag('LEXWARE_OFFICE_READ_ONLY');
+	readEnvFlag('LEXWARE_OFFICE_ALLOW_WRITES');
 
 	// The global LEXWARE_OFFICE_ALLOW_WRITES only applies to single-account setups.
 	// With 2+ accounts every account must opt in to writes on its own.
@@ -441,6 +532,14 @@ function parseAccountList(json: string, source: string): AccountConfig[] {
 			throw new Error(`${source} entry #${index + 1} must be an object`);
 		}
 		const entry = item as Record<string, unknown>;
+		for (const flag of ['allowWrites', 'readOnly']) {
+			if (entry[flag] !== undefined && typeof entry[flag] !== 'boolean') {
+				throw new Error(`${source} entry #${index + 1}: ${flag} must be true or false (JSON boolean, not a string)`);
+			}
+		}
+		if (entry.baseUrl !== undefined && typeof entry.baseUrl !== 'string') {
+			throw new Error(`${source} entry #${index + 1}: baseUrl must be a string`);
+		}
 		if (typeof entry.apiKey !== 'string' || entry.apiKey.trim().length === 0) {
 			throw new Error(`${source} entry #${index + 1} is missing a non-empty string apiKey`);
 		}
@@ -794,19 +893,35 @@ async function resolveUploadPath(contentPath: string): Promise<string> {
 
 async function readUploadFile(requestedPath: string): Promise<Buffer<ArrayBuffer>> {
 	const contentPath = await resolveUploadPath(requestedPath);
-	let stats;
+	// Open once and read through the handle; O_NOFOLLOW where the platform supports it.
+	let handle: FileHandle;
 	try {
-		stats = await stat(contentPath);
+		handle = await open(contentPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
 	} catch {
 		throw new Error(`multipart contentPath not found or not readable: ${requestedPath}`);
 	}
-	if (!stats.isFile()) {
-		throw new Error(`multipart contentPath must be a regular file: ${contentPath}`);
+	try {
+		const stats = await handle.stat({ bigint: true });
+		if (!stats.isFile()) {
+			throw new Error(`multipart contentPath must be a regular file: ${contentPath}`);
+		}
+		if (stats.nlink > 1n) {
+			// realpath cannot see hard links, so a link to a file outside the directory would pass the containment check.
+			throw new Error(`multipart contentPath must not be a hard-linked file: ${contentPath}`);
+		}
+		if (stats.size > BigInt(MAX_UPLOAD_FILE_BYTES)) {
+			throw new Error(`multipart contentPath file is ${stats.size} bytes, exceeding the ${MAX_UPLOAD_FILE_BYTES} byte upload limit: ${contentPath}`);
+		}
+		// Re-resolve after opening and make sure the opened file is still the one inside the upload directory.
+		const recheckedPath = await resolveUploadPath(requestedPath);
+		const current = await stat(recheckedPath, { bigint: true });
+		if (current.dev !== stats.dev || current.ino !== stats.ino) {
+			throw new Error(`multipart contentPath changed while it was being read: ${requestedPath}`);
+		}
+		return await handle.readFile() as Buffer<ArrayBuffer>;
+	} finally {
+		await handle.close();
 	}
-	if (stats.size > MAX_UPLOAD_FILE_BYTES) {
-		throw new Error(`multipart contentPath file is ${stats.size} bytes, exceeding the ${MAX_UPLOAD_FILE_BYTES} byte upload limit: ${contentPath}`);
-	}
-	return readFile(contentPath) as Promise<Buffer<ArrayBuffer>>;
 }
 
 function sha256Hex(buffer: Buffer): string {
